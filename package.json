@@ -1,0 +1,62 @@
+{
+  "name": "dsh-session-link-pro",
+  "version": "0.2.2",
+  "description": "Session deep links + full session export (markdown/JSON) + approved cross-session messaging for DeepSeek Harness (dsh).",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "dsh-open.cmd",
+    "register-protocol.ps1",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node host-half.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "deep-link",
+    "session",
+    "context",
+    "export",
+    "cross-session",
+    "plugin"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shenhuanageshei/dsh-session-link-pro.git"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-session-reference": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "*",
+    "schemastery": "^3.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-conversation": "^0.1.0-rc.6"
+  }
+}

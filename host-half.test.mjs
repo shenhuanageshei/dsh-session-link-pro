@@ -258,9 +258,15 @@ const sendOut = await sendTool.execute({ targetSessionId: "session-target", mess
 check("send reports wake delivery", sendOut.includes("已投递") && sendOut.includes("唤醒"));
 check("idle target received followup() once", sendEnv.targetCalls.followedup.length === 1 && sendEnv.targetCalls.injected.length === 0 && sendEnv.targetCalls.steered.length === 0);
 const delivered = sendEnv.targetCalls.followedup[0];
+// The audited admission set of the DSH 0.1.5 session-log migration
+// (@deepseek-ai/dsh-session-format-v2-to-v3 `SOURCE_KINDS`). An unknown kind — or
+// one extra member on `agent-message` — refuses the WHOLE session log, so the
+// delivered shape is pinned here rather than left to a source comment.
+const AUDITED_SOURCE_KINDS = new Set(["user", "plugin", "model", "tool", "agent-instructions", "session-reference", "team-message", "goal", "skill-invocation", "skill-catalog", "coordinator", "subagent-report", "subagent-settled", "webhook", "agent-message"]);
 check("delivered message is a valid user message", delivered.role === "user" && typeof delivered.id === "string" && delivered.id.startsWith("slp-") && Array.isArray(delivered.content));
-check("delivered message carries provenance source", delivered.source.kind === "session-link-pro" && delivered.source.fromSession === "session-self" && delivered.source.plugin === "dsh-session-link-pro");
-check("delivered source carries relay metadata", delivered.source.form === "relay" && delivered.source.senderSessionId === "session-self");
+check("delivered source is the audited agent-message relay shape", delivered.source.kind === "agent-message" && delivered.source.form === "relay" && delivered.source.senderSessionId === "session-self");
+check("delivered source carries exactly the three audited members", Object.keys(delivered.source).length === 3 && AUDITED_SOURCE_KINDS.has(delivered.source.kind));
+check("delivered banner names the sender and the relay time", /📨 \[跨会话消息 · 来自会话 .+ · \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]/.test(delivered.content[0].text));
 check("delivered text embeds the payload", delivered.content[0].text.includes("联调提醒：接口地址已切换"));
 check("sender approval asked on sender agent", sendEnv.uq.requests[0].questions[0].id === "send-confirm" && sendEnv.uq.requests[0].agent === sendEnv.senderAgent);
 check("receiver confirmation asked on target agent", sendEnv.uq.requests[1].questions[0].id === "receive-confirm" && sendEnv.uq.requests[1].agent === sendEnv.targetAgent);

@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-link-pro",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Session deep links + full session export (markdown/JSON) + approved cross-session messaging for DeepSeek Harness (dsh).",
   "type": "module",
   "main": "lib/index.js",
@@ -19,7 +19,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node host-half.test.mjs"
+    "test": "node host-half.test.mjs && node client-half.test.mjs"
   },
   "dsh": {
     "bundle": {
@@ -50,13 +50,13 @@
     "url": "git+https://github.com/shenhuanageshei/dsh-session-link-pro.git"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-session-reference": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-tools": "*",
     "schemastery": "^3.0.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-client-ui-conversation": "^0.1.0-rc.6"
+    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.6 || ^0.1.5-rc.1",
+    "@deepseek-ai/dsh-client-ui-conversation": "^0.1.0-rc.6 || ^0.1.5-rc.1",
+    "@deepseek-ai/dsh-session-reference": "^0.1.0-rc.6 || ^0.1.5-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6 || ^0.1.5-rc.1"
   }
 }

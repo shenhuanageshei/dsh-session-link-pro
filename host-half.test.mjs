@@ -81,7 +81,7 @@ function makeQuery(sessions, eventsBySession = {}) {
 }
 
 /** Build a full plugin environment on a fresh cordis Context. */
-function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle" } = {}) {
+function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false } = {}) {
 	const ctx = new Context();
 	const prepared = [];
 	let failWith = null;
@@ -91,7 +91,7 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 			prepared.push({ references });
 			return {
 				content,
-				additionalContext: { id: "injected-1", role: "user", source: { kind: "session-reference" }, content: [{ type: "text", text: "SNIPPET" }] },
+				additionalContext: omitContext ? undefined : { id: "injected-1", role: "user", source: { kind: "session-reference" }, content: [{ type: "text", text: contextText }] },
 			};
 		},
 	};
@@ -323,6 +323,122 @@ const selfOut = await guardEnv.tool("session_link_pro_send").execute({ targetSes
 check("self-send refused", selfOut.includes("不能是当前会话"));
 const deadOut = await guardEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-cold", message: "喂" }, execFor(guardEnv.senderAgent));
 check("dead target refused", deadOut.includes("没有活动代理"));
+
+// ---------------------------------------------------------------------------
+// -pro: lone-surrogate safety (code-point truncation + well-formed output)
+// ---------------------------------------------------------------------------
+// A lone surrogate (half of an emoji) in tool output is not cosmetic. The
+// orchestrator forwards a tool result verbatim into the next model request, and
+// an unpaired UTF-16 surrogate makes that request fail with HTTP 400
+// INVALID_REQUEST — permanently: the poisoned text stays in the history, so
+// every later turn of that session dies the same way. Observed on all four of
+// the logged sessions that carried one over deepseek-official (a local scan of
+// 882 session logs found five with a real lone surrogate; the fifth, on qax,
+// survived). This list tool's topic/activity preview was the source: `slice(0, 89)`
+// cut at code-unit index 88 and the emoji sat exactly there.
+//
+// The contract pinned below: a returned string carries an astral character
+// COMPLETE or not at all — never half of it.
+
+const LONE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+const hasLone = (text) => LONE.test(String(text));
+
+/** One-session environment whose surface topic is rewritten per case. */
+const loneTopicEvents = [
+	{ type: "user/message", seq: 1, time: 1, data: { id: "e1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "" }] } },
+];
+const loneEnv = setup({
+	sessions: [{ header: { id: "session-emoji", createdAt: 5000, cwd: CWD }, live: false, persisted: true }],
+	eventsBySession: { "session-emoji": loneTopicEvents },
+});
+const loneListTool = loneEnv.tool("session_link_pro_list_sessions");
+const setLoneTopic = (text) => { loneTopicEvents[0].data.content[0].text = text; };
+/** Run the list tool on one topic and return the whole output plus its 主题段. */
+const listForTopic = async (topic) => {
+	setLoneTopic(topic);
+	const out = await loneListTool.execute({}, execFor(loneEnv.senderAgent));
+	const line = out.split("\n").find((candidate) => candidate.includes("主题："));
+	return { out, preview: line === undefined ? "" : line.slice(line.indexOf("主题：") + "主题：".length) };
+};
+
+// (a) property: one emoji walked across EVERY offset 0..120 of the topic, so the
+//     limit-90 cut lands on every code unit in turn — including the two halves.
+const loneOffsets = [];
+for (let n = 0; n <= 120; n += 1) {
+	const { out } = await listForTopic(`${"x".repeat(n)}🔵 尾巴`);
+	if (hasLone(out)) loneOffsets.push(n);
+}
+check(`list output carries no lone surrogate at any of 121 cut offsets (bad offsets: ${loneOffsets.length === 0 ? "none" : loneOffsets.join(",")})`, loneOffsets.length === 0);
+
+// (b) the production accident, pinned exactly: 88 x then the emoji puts its high
+//     surrogate at code-unit index 88 — the last unit `slice(0, 89)` kept.
+const boundaryCase = await listForTopic(`${"x".repeat(88)}🔵尾巴`);
+check("production boundary: list output has no lone surrogate", !hasLone(boundaryCase.out));
+check("production boundary: the preview segment is exactly 90 code points", [...boundaryCase.preview].length === 90);
+check("production boundary: the preview segment keeps the whole emoji, then the ellipsis", boundaryCase.preview.endsWith("🔵…"));
+
+// (c) a topic that ALREADY carries a lone surrogate (a log written by an older
+//     build, or any foreign text) must be repaired on the way out, not forwarded:
+//     code-point cutting alone cannot fix a source that is already half an emoji.
+const prePoisoned = await listForTopic(`${"x".repeat(10)}\uD83D 断开的 emoji`);
+check("pre-poisoned topic: repaired, never forwarded", !hasLone(prePoisoned.out));
+check("pre-poisoned topic: surrounding text survives the repair", prePoisoned.out.includes("断开的 emoji"));
+
+// (d) the export path: truncate() cuts at MD_BLOCK_LIMIT (16000) with an explicit
+//     marker, and the count in that marker is part of the honest rendering.
+const longText = `${"x".repeat(15999)}🔵尾巴`;
+const truncEnv = setup({
+	sessions: [{ header: { id: "session-long", createdAt: 6000, cwd: CWD }, live: false, persisted: true }],
+	eventsBySession: { "session-long": [{ type: "user/message", seq: 1, time: 1, data: { id: "l1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: longText }] } }] },
+});
+const truncDir = path.resolve(".test-tmp-lone");
+rmSync(truncDir, { recursive: true, force: true });
+const truncOut = await truncEnv.tool("session_link_pro_export").execute({ sessionId: "session-long", outputDir: truncDir }, execFor(truncEnv.senderAgent));
+const truncMdPath = truncOut.split("\n").map((line) => line.replace("- ", "").trim()).find((line) => line.endsWith(".md"));
+const truncMd = truncMdPath === undefined ? "" : await readFile(truncMdPath, "utf8");
+check("export md artifact written for the oversized text", truncMdPath !== undefined);
+check("export md has no lone surrogate", !hasLone(truncMd));
+check("export md keeps the whole emoji at the cut", truncMd.includes(`${"x".repeat(15999)}🔵\n…[已截断 2 字符]`));
+check("export md counts the cut in code points, not code units", !truncMd.includes("已截断 3 字符"));
+rmSync(truncDir, { recursive: true, force: true });
+
+// (e) the approval dialogs and the relayed banner are outward strings too: a lone
+//     surrogate in the payload must not reach the sender's dialog, and — worse —
+//     must not be written into the TARGET session's log by the relay banner.
+const poisonText = `${"y".repeat(5)}\uD83D 断开的负载`;
+const poisonEnv = setup({ sessions, askScript: ["发送", "接收"] });
+await poisonEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-target", message: poisonText }, execFor(poisonEnv.senderAgent));
+check("sender confirm dialog has no lone surrogate", poisonEnv.uq.requests[0] !== undefined && !hasLone(poisonEnv.uq.requests[0].questions[0].question));
+check("receiver confirm dialog has no lone surrogate", poisonEnv.uq.requests[1] !== undefined && !hasLone(poisonEnv.uq.requests[1].questions[0].question));
+const poisonDelivered = poisonEnv.targetCalls.followedup[0];
+check("delivered relay banner has no lone surrogate", poisonDelivered !== undefined && !hasLone(poisonDelivered.content[0].text));
+check("delivered relay banner keeps the payload text", poisonDelivered !== undefined && poisonDelivered.content[0].text.includes("断开的负载"));
+
+// (f) the deep-link snapshot is this plugin's MOST direct carrier into the
+//     caller's own next request. A lone surrogate inside the referenced session's
+//     log must be repaired on the way in — an upstream resolver change is not
+//     needed for that, only a well-formed copy of what it hands over.
+const linkEnv = setup({ contextText: `${"z".repeat(3)}\uD83D 快照` });
+const linkPrompt = { id: "link-1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "参考 dsh://session/session-abc123 继续" }] };
+const linkDecision = await ctx_waterfall(linkEnv.ctx, { messages: [linkPrompt], turn: 30, step: 1 });
+check("injected snapshot has no lone surrogate", linkDecision.messages.length === 2 && !hasLone(linkDecision.messages[0].content[0].text));
+check("injected snapshot keeps its text", linkDecision.messages.length === 2 && linkDecision.messages[0].content[0].text.includes("快照"));
+
+// (g) tool-argument echo: a model that copies a broken id back into
+//     targetSessionId must not have that half-emoji echoed into its own history
+//     by the refusal text.
+const echoEnv = setup({ sessions, askScript: [] });
+const echoOut = await echoEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-nope\uD83D", message: "x" }, execFor(echoEnv.senderAgent));
+check("a refusal echoing a poisoned target id is repaired", !hasLone(echoOut));
+check("a refusal still names the target id it was given", echoOut.includes("session-nope"));
+
+// (h) `additionalContext` is optional in the resolver's contract: a resolver that
+//     omits it must not get `undefined` spliced into the outgoing message array.
+const noContextEnv = setup({ omitContext: true });
+const noContextPrompt = { id: "link-2", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "参考 dsh://session/session-abc123 继续" }] };
+const noContextDecision = await ctx_waterfall(noContextEnv.ctx, { messages: [noContextPrompt], turn: 31, step: 1 });
+check("a missing snapshot context drops the injection instead of splicing undefined", noContextDecision.messages.length === 1 && noContextDecision.messages[0].id === "link-2");
+check("the direct prompt still survives without a snapshot", noContextDecision.messages.length === 1 && noContextDecision.messages[0]?.content?.[0]?.text === "参考 @session-abc123 继续");
 
 // cleanup
 rmSync(tmpDir, { recursive: true, force: true });

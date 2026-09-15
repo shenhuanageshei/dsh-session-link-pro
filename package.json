@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-link-pro",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Session deep links + full session export (markdown/JSON) + approved cross-session messaging for DeepSeek Harness (dsh).",
   "type": "module",
   "main": "lib/index.js",

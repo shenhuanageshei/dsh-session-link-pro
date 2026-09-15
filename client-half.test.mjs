@@ -191,6 +191,50 @@ const renderChild = (element) => element.type(element.props);
 check("copy button carries the session aria-label", String(renderChild(header.children[0]).props["aria-label"]) === "copyLink");
 check("export button carries the export label", String(renderChild(header.children[1]).props.title) === "exportSession");
 
+// ---------------------------------------------------------------------------
+// 9. lone-surrogate safety: the shortened session id cuts on code points
+// ---------------------------------------------------------------------------
+
+// `id.slice(0, 14)` can keep a trailing HIGH surrogate and `id.slice(-8)` can
+// start on a LOW one whenever a pair straddles either index — the same
+// code-unit cut that poisons a host tool result. This path is display-only: a
+// browser text node goes through the DOM's USVString conversion (which maps a
+// lone surrogate to U+FFFD) and the string never re-enters a model request, so
+// the old form was cosmetically wrong rather than session-killing. Pinned
+// anyway, because it IS reachable with a non-ASCII id and the code-point cut is
+// a no-op for the ASCII ids the harness mints.
+const LONE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+const headHigh = "session-xxxxx🔵"; // the emoji's high half lands on code-unit index 13
+const astralId = headHigh + "y".repeat(4) + "🔵" + "z".repeat(7); // and a low half 8 units from the end
+const astralCard = render({ source: { kind: "agent-message", form: "relay", senderSessionId: astralId }, content: textOf([relayBody(astralId, undefined, "emoji id")]) }, "slp-88888888-8888-8888-8888-888888888888");
+const astralSender = spanText(headSpan(astralCard, "dshsl-relay-sender"));
+check("astral session id renders as a card", isCard(astralCard));
+check("astral session id shortens without a lone surrogate", !LONE.test(astralSender));
+check("astral session id keeps 14 head + 8 tail code points", [...astralSender.replace("来自 ", "")].length === 14 + 1 + 8);
+check("astral session id keeps the whole head emoji", astralSender.startsWith("来自 session-xxxxx🔵"));
+const asciiId = "session-" + "a".repeat(32);
+const asciiCard = render({ source: { kind: "agent-message", form: "relay", senderSessionId: asciiId }, content: textOf([relayBody(asciiId, undefined, "ascii id")]) }, "slp-99999999-9999-9999-9999-999999999999");
+check("ASCII session id shortening is unchanged", spanText(headSpan(asciiCard, "dshsl-relay-sender")) === "来自 session-aaaaaa…aaaaaaaa");
+const shortIdCard = render({ source: { kind: "agent-message", form: "relay", senderSessionId: "session-b" }, content: textOf([relayBody("session-b", undefined, "短 id")]) }, "slp-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+check("short id still passes through unchanged", spanText(headSpan(shortIdCard, "dshsl-relay-sender")) === "来自 session-b");
+// A row written by an older build (or any foreign row claiming this shape) can
+// already carry a lone surrogate. The DOM would repair it via USVString
+// conversion; this harness has no DOM, so the repair is asserted where it is
+// visible — the rendered body text itself.
+const poisonedLegacy = render({ source: { kind: "session-link-pro", fromSession: "session-p", sentAt: legacyWhen }, content: textOf([relayBody("session-p", undefined, "断开的\uD83D 负载")]) }, "slp-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+check("a lone surrogate in a legacy row body is repaired", !LONE.test(bodyTextOf(poisonedLegacy)));
+check("the repaired legacy body keeps its text", bodyTextOf(poisonedLegacy).includes("断开的") && bodyTextOf(poisonedLegacy).includes("负载"));
+// A SHORT (unshortened, <= 26 code units) id is returned verbatim by the
+// shortener, so the repair has to sit on the rendered value, not only on the cut.
+const rawHalfId = "session-\uD83Dq";
+const poisonedRawId = render({ source: { kind: "session-link-pro", fromSession: rawHalfId, sentAt: legacyWhen }, content: textOf([relayBody(rawHalfId, undefined, "短 id 带半截")]) }, "slp-cccccccc-cccc-cccc-cccc-cccccccccccc");
+check("a short poisoned sender id is repaired", rawHalfId.length <= 26 && !LONE.test(spanText(headSpan(poisonedRawId, "dshsl-relay-sender"))));
+// The delegation fallback renders OTHER plugins' context text — still this file's
+// output, so it goes through the same repair.
+const foreignHalf = render({ source: { kind: "plugin", plugin: "other-plugin", form: "notice" }, content: textOf(["外来的\uD83D 半截文本"]) }, "node-9");
+check("a lone surrogate in delegated foreign context is repaired", isDelegated(foreignHalf) && !LONE.test(delegatedTextOf(foreignHalf)));
+check("the delegated foreign text is otherwise untouched", delegatedTextOf(foreignHalf).includes("半截文本"));
+
 console.log("");
 if (failures === 0) console.log("ALL PASS");
 else console.log(`${failures} FAILURE(S)`);

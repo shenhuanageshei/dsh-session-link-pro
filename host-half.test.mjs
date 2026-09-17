@@ -1495,6 +1495,19 @@ check("M4 claim: rotation-done is broadcast with the ratified status, from the n
 })());
 check("M4 claim: a ratified migration opens no rollback window", rotClaim.includes("迁移的 pairs 已是正式通道（无回退窗口）") && rotA.role().provisional === null);
 
+// --- M4 代码评审 #4: the mirror must not keep advertising a cleared pending ---
+
+const rotClaimMirror = await readFile(mirrorFile, "utf8");
+
+check("评审 #4: after a claim the roster mirror renders the post-clear roster — no pending line, no masked token left behind", /### coordinator[\s\S]*?- pending：（无）/u.test(rotClaimMirror) && !rotClaimMirror.includes("tok-"));
+
+// --- M4 代码评审 #6: the outgoing holder hears the hand-over completed --------
+
+check("评审 #6: the retiree (no longer a member after the claim) still receives rotation-done", (() => {
+	const done = rotA.senderCalls.followedup.filter((message) => message.content[0].text.includes("[rotation-done]"));
+	return done.length === 1 && done[0].content[0].text.includes(`旧任 ${ROT_SELF} → 新任 ${SUCCESSOR}`) && done[0].source.senderSessionId === SUCCESSOR && Object.keys(done[0].source).length === 3;
+})());
+
 const rotSend = await rotA.send.execute({ targetSessionId: "session-worker-a", message: "交接后的正式通道" }, rotA.exec(SUCCESSOR));
 check("M4: a delivery over the migrated channel is a plain paired delivery (no provisional suffix)", rotSend.includes("已投递到") && rotSend.includes("已配对通道") && !rotSend.includes("provisional"));
 
@@ -1593,7 +1606,7 @@ check("U6 provisional 可见面: list_sessions marks the unratified channel on t
 check("U6 provisional 可见面: the marker sits before the reading stamp, so the row still ends with the stamp", /- session-worker-a[^\n]*provisional 配对 1 条（换届临时信任：24h 内未批准自动回退，见 team_link_roster）（读数 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，>2min 作废）/u.test(rotListOut));
 
 const rotRollbackNow = rotProvClaimAt + 24 * 3600000 + 60000;
-const rotRollbackSweep = await rotProvEnv.rotation.sweep({ now: rotRollbackNow, askReceiver: false });
+const rotRollbackSweep = await rotProvEnv.rotation.sweep({ now: rotRollbackNow });
 check("U6: at the 24h mark the sweep deletes the provisional pairs (评审 #5)", rotRollbackSweep.expired.length === 1 && rotProvEnv.ns.data.pairs.length === 0 && pairSummary(rotProvEnv) === "");
 check("U6: history records the unratified rollback and the window closes", (() => {
 	const entry = rotProvEnv.role();
@@ -1642,7 +1655,7 @@ check("M4 广播路径: the explicit block still beats an internal notice (no se
 // request log proves far better than a refusal text.
 const rotAskEnv = rotateEnv({ receiveMode: "ask" });
 rotAskEnv.role().pending = { session: SUCCESSOR, token: "ask-token", team: "night-shift", role: "coordinator", expiresAt: Date.now() - 1000, createdAt: Date.now() - 31 * 60000, migratedPairs: [] };
-const rotAskSweep = await rotAskEnv.rotation.sweep({ now: Date.now(), askReceiver: false });
+const rotAskSweep = await rotAskEnv.rotation.sweep({ now: Date.now() });
 check("M4 广播路径: a sweep-originated notice never opens a dialog — an ask receiver is skipped with a readable row", rotAskSweep.lines.join("\n").includes("不弹确认框") && rotAskEnv.uq.requests.length === 0 && rotAskEnv.calls("session-worker-a").followedup.length === 0 && rotAskEnv.role().pending === null);
 
 const { freezeNotice: rotFreezeNotice, doneNotice: rotDoneNotice, cancelledNotice: rotCancelledNotice, expiredNotice: rotExpiredNotice, maskToken: rotMaskToken, teamMembers: rotTeamMembers, planRotationMigration: rotPlanMigration, applyRotationTrust: rotApplyTrust, rotateGate: rotRotateGate, readRoleName: rotReadRoleName } = __testing;
@@ -1681,6 +1694,85 @@ check("R5: the other targets keep their deliveries and the summary line is still
 const rotStarEnv = teamEnv({ teams: [teamRow({ writer: "any", current: "session-self" })] });
 const rotStarOut = await rotStarEnv.tool("team_link_roster").execute({ action: "set-role", team: "night-shift", role: "*", session: "session-target" }, execFor(rotStarEnv.senderAgent));
 check("R6: set-role refuses the addressing grammar's reserved word and creates no such role", rotStarOut.includes("寻址文法保留字") && rotStarEnv.store()[0].roles.every((entry) => entry.role !== "*"));
+
+// --- M4 代码评审修复 #1/#2/#3/#5/#7 ----------------------------------------
+
+// #1: the settled signal is `current === pending.session`, empty marker included.
+// A rotation with no in-domain candidate migrates nothing, so its migratedPairs
+// marker stays empty; a crash between the settlement and the pending clear then
+// leaves exactly this state, and the replay must not run the migration path again
+// (there the retiree reads as the successor itself, which would revoke the
+// successor's own pairs and re-grant them provisionally, unattended).
+
+const rotEmptyReplayEnv = rotateEnv({ pairs: [{ a: SUCCESSOR, b: "session-worker-a", createdAt: 5 }] });
+rotEmptyReplayEnv.role().current = SUCCESSOR;
+rotEmptyReplayEnv.role().pending = { session: SUCCESSOR, token: "empty-marker-token", team: "night-shift", role: "coordinator", expiresAt: Date.now() + 600000, createdAt: Date.now(), migratedPairs: [] };
+const rotEmptyReplayOut = await rotEmptyReplayEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: "empty-marker-token" }, rotEmptyReplayEnv.exec(SUCCESSOR));
+check("评审 #1: an empty migratedPairs marker next to current=successor replays instead of migrating", rotEmptyReplayOut.includes("claim 重放") && rotEmptyReplayOut.includes("不重复迁移") && !rotEmptyReplayOut.includes("对称撤销"));
+check("评审 #1: ... the successor's own pairs survive the replay byte-for-byte", pairSummary(rotEmptyReplayEnv) === "session-new↔session-worker-a" && rotEmptyReplayEnv.ns.data.pairs.length === 1);
+check("评审 #1: ... and the replay still finishes the bookkeeping and re-emits rotation-done", rotEmptyReplayEnv.role().pending === null && rotEmptyReplayEnv.calls("session-worker-a").followedup.at(-1).content[0].text.includes("[rotation-done]"));
+// #4: the replay is the step that finishes the bookkeeping, so it must rewrite the
+// mirror — otherwise roster.md keeps showing a pending the settings no longer have.
+const rotReplayMirrorEnv = rotateEnv({ pairs: [{ a: SUCCESSOR, b: "session-worker-a", createdAt: 5 }] });
+rotReplayMirrorEnv.role().current = SUCCESSOR;
+rotReplayMirrorEnv.role().pending = { session: SUCCESSOR, token: "mirror-replay-token", team: "night-shift", role: "coordinator", expiresAt: Date.now() + 600000, createdAt: Date.now(), migratedPairs: [] };
+await rotReplayMirrorEnv.roster.execute({ action: "upsert-team", team: "night-shift" }, rotReplayMirrorEnv.exec(SUCCESSOR));
+const rotReplayMirrorBefore = await readFile(mirrorFile, "utf8");
+check("评审 #4 前置: the mirror truthfully renders the leftover pending (masked) before the replay", rotReplayMirrorBefore.includes("tok-mirr…oken") && rotReplayMirrorBefore.includes("已迁移 0 条"));
+await rotReplayMirrorEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: "mirror-replay-token" }, rotReplayMirrorEnv.exec(SUCCESSOR));
+const rotReplayMirrorAfter = await readFile(mirrorFile, "utf8");
+check("评审 #4: the replay rewrites the mirror — the leftover pending leaves no line behind", !rotReplayMirrorAfter.includes("tok-") && /### coordinator[\s\S]*?- pending：（无）/u.test(rotReplayMirrorAfter));
+
+// #1 (sweep half): the same state at expiry is bookkeeping, not an unclaimed token.
+const rotSettledSweepEnv = rotateEnv();
+rotSettledSweepEnv.role().current = SUCCESSOR;
+rotSettledSweepEnv.role().pending = { session: SUCCESSOR, token: "settled-sweep-token", team: "night-shift", role: "coordinator", expiresAt: Date.now() - 1000, createdAt: Date.now() - 31 * 60000, migratedPairs: [] };
+const rotSettledSweep = await rotSettledSweepEnv.rotation.sweep({ now: Date.now() });
+check("评审 #1: the sweep reads a settled roster (empty marker included) as settled — pending goes silently, no rotation-cancelled", rotSettledSweep.cancelled.length === 0 && rotSettledSweep.lines.length === 0 && rotSettledSweepEnv.role().pending === null && rotSettledSweepEnv.calls("session-worker-a").followedup.length === 0);
+
+const rotSettledExpiredEnv = rotateEnv({ pairs: [{ a: SUCCESSOR, b: "session-worker-a", createdAt: 5 }] });
+rotSettledExpiredEnv.role().current = SUCCESSOR;
+rotSettledExpiredEnv.role().pending = { session: SUCCESSOR, token: "settled-expired-token", team: "night-shift", role: "coordinator", expiresAt: Date.now() - 1000, createdAt: Date.now() - 31 * 60000, migratedPairs: [] };
+const rotSettledExpiredOut = await rotSettledExpiredEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: "settled-expired-token" }, rotSettledExpiredEnv.exec(SUCCESSOR));
+check("评审 #1: an expired token on a settled roster refuses with the truth — no false '旧任仍为 current', no cancelled broadcast, pending cleared", rotSettledExpiredOut.includes("已经落定") && rotSettledExpiredOut.includes("静默清除 pending") && !rotSettledExpiredOut.includes("仍为 current") && rotSettledExpiredEnv.calls("session-worker-a").followedup.length === 0 && rotSettledExpiredEnv.role().pending === null);
+
+// #2: 补批准 (settings UI flips the pair's provisional flag) keeps the role window
+// open, so the window expires with nothing to roll back. Recording "provisional
+// 未批准过期" and broadcasting "迁移的 pairs 已删除" would both be false statements.
+const rotRatifiedEnv = rotateEnv({ omitUserQuestions: true, pairs: [rotPair("session-worker-a"), rotPair("session-worker-b")] });
+const rotRatifiedToken = tokenOf(await rotRatifiedEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rotRatifiedEnv.senderAgent)));
+const rotRatifiedAt = Date.now();
+await rotRatifiedEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: rotRatifiedToken }, rotRatifiedEnv.exec(SUCCESSOR));
+for (const pair of rotRatifiedEnv.ns.data.pairs) pair.provisional = false;
+check("评审 #2 前置: 补批准 flips the pairs only — the role window is still open", rotRatifiedEnv.role().provisional !== null && rotRatifiedEnv.ns.data.pairs.every((pair) => pair.provisional === false));
+const rotRatifiedSweep = await rotRatifiedEnv.rotation.sweep({ now: rotRatifiedAt + 24 * 3600000 + 60000 });
+check("评审 #2: a ratified window closes silently — no rotation-expired, no '未批准过期' history entry", rotRatifiedSweep.expired.length === 0 && rotRatifiedSweep.closed.length === 1 && rotRatifiedEnv.role().provisional === null && rotRatifiedEnv.role().history.every((record) => record.note !== "provisional 未批准过期") && rotRatifiedEnv.calls("session-worker-a").followedup.every((message) => !message.content[0].text.includes("[rotation-expired]")));
+check("评审 #2: ... the ratified channels are kept and the sweep says why it closed the window", rotRatifiedEnv.ns.data.pairs.length === 2 && pairSummary(rotRatifiedEnv) === "session-new↔session-worker-a session-new↔session-worker-b" && rotRatifiedSweep.lines.join("\n").includes("provisional 窗口静默关闭"));
+
+// #3: an internal notice never waits on a receiver dialog — prepare/claim included.
+const rotAskNoticeEnv = rotateEnv({ receiveMode: "ask" });
+const rotAskNoticePrep = await rotAskNoticeEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rotAskNoticeEnv.senderAgent));
+check("评审 #3: an ask-mode member receives the internal freeze as a skipped row — no dialog, no wait", rotAskNoticeEnv.uq.requests.length === 0 && rotAskNoticeEnv.calls("session-worker-a").followedup.length === 0 && rotAskNoticeEnv.calls("session-worker-b").followedup.length === 0 && rotAskNoticePrep.includes("rotation-freeze"));
+check("评审 #3: the skipped row is recorded per target and names the two ways to receive it later", (rotAskNoticePrep.match(/→ refused：未投递：目标会话的接收策略为逐条确认（ask），而插件内部通知/gu) ?? []).length === 2 && rotAskNoticePrep.includes("不弹确认框"));
+const rotAskNoticeClaim = await rotAskNoticeEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: tokenOf(rotAskNoticePrep) }, rotAskNoticeEnv.exec(SUCCESSOR));
+check("评审 #3: the claim's own rotation-done notice takes the same non-blocking path", rotAskNoticeEnv.uq.requests.length === 0 && rotAskNoticeClaim.includes("通知广播（rotation-done，新任为发送方）：0 投递"));
+
+// #5: nothing to migrate means nobody was asked — the verdict word must not say
+// "已批准" (and must not claim a rollback window that was never opened).
+const rotNoneEnv = rotateEnv();
+const rotNonePrep = await rotNoneEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rotNoneEnv.senderAgent));
+const rotNoneClaim = await rotNoneEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: tokenOf(rotNonePrep) }, rotNoneEnv.exec(SUCCESSOR));
+check("评审 #5: a rotation with no in-domain candidate opens no dialog and claims no approval", rotNoneEnv.uq.requests.length === 0 && rotNoneClaim.includes("无域内待迁移对：未弹确认框") && !rotNoneClaim.includes("已获在场确认") && rotNoneClaim.includes("回退窗口：本次换届没有新建任何通道"));
+check("评审 #5: ... the done notice carries the same verdict word instead of 已批准", rotNoneEnv.calls("session-worker-a").followedup.at(-1).content[0].text.includes("信任迁移状态：无待迁移对") && !rotNoneEnv.calls("session-worker-a").followedup.at(-1).content[0].text.includes("24h 内未获批准将自动回退"));
+check("评审 #5: ... and the roster opened no provisional window", rotNoneEnv.role().provisional === null && rotNoneEnv.role().current === SUCCESSOR && rotNoneEnv.role().pending === null);
+
+// #7: team_read is a third lazy trigger, so a frozen team that only reads the
+// board still gets its notice (the patrol timer only exists per registration).
+const rotReadSweepEnv = rotateEnv({ pairs: [rotPair("session-worker-a")] });
+rotReadSweepEnv.role().pending = { session: SUCCESSOR, token: "read-sweep-token", team: "night-shift", role: "coordinator", expiresAt: Date.now() - 1000, createdAt: Date.now() - 31 * 60000, migratedPairs: [] };
+const rotReadSweepOut = await rotReadSweepEnv.tool("team_link_team_read").execute({ team: "night-shift" }, execFor(rotReadSweepEnv.senderAgent));
+check("评审 #7: team_read triggers the expiry sweep — the stranded pending is cleared and rotation-cancelled is broadcast", rotReadSweepEnv.role().pending === null && rotReadSweepEnv.calls("session-worker-a").followedup.some((message) => message.content[0].text.includes("[rotation-cancelled]")));
+check("评审 #7: ... and the read itself still returns the board (the sweep is not a substitute for it)", rotReadSweepOut.includes("黑板（根：") && rotReadSweepOut.includes("roster（概要"));
 
 // --- §5.3 红线: the plugin never re-arms a goal itself ----------------------
 

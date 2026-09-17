@@ -342,6 +342,16 @@ function sweepExpiredPendings() {
 //   send 走 provisional pair 时返回文案后缀 "（provisional 通道，24h 内未批准自动回退）"；信封 meta 不扩字段。
 ```
 
+// ---- 实现评审补丁（0.3.4 代码评审 round 1/2 落地，as-of 2eb6d11）----
+// P1（已落定判据）：claim/sweep 的「已落定」信号 = current === pending.session（prepare 拒绝自换保证全新
+//     pending 无此态）；migratedPairs 仅作清单，不再是落定判据（空标记落定态曾致重放把继任者当退役者）。
+// P2（TTL 双层执行）：pairRecordBetween 视「provisional 且 expiresAt <= now」为无 pair（投递侧守门，活记录
+//     优先于同对死记录）；sweep 的 doomed 删除先于 touched 守卫（清扫侧兜底）——手删窗口也不会让过期
+//     provisional 对免门存续。
+// P3（身份交错）：set-role 把角色交给 pending.session（继任者）时顺手清 pending——令牌随身份显式变更失效，
+//     防止后续 claim 误走 replay 跳过对称撤销。
+// P4（重放状态词）：claim 落定时把状态词记入 role.rotationStatus（schema 显式声明防 settings 往返抹除），
+//     replayClaim 直读记录值，不再从残留字段重推。
 #### 3.6.3 时序图
 
 ```mermaid

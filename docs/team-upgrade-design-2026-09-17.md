@@ -2,7 +2,7 @@
 
 > **文档用途**：本文档是 `team-upgrade-research-2026-09-17.md`（下称《调研》）§5 提案的实施级修正设计。对《调研》§7 议题的裁决、DSH 0.1.5 源码验证事实、会诊 #27 的意见处置记录在 §1.2 / §8。机制均带伪代码与 schema；验收标准对齐仓库既有测试形态（`host-half.test.mjs`）。
 >
-> **状态**：v1.2（2026-09-17 会诊 #27 整合完毕后，随 0.3.0 更名 `dsh-team-link` 同批更新工具名为 `team_link_*`；更名决策与不变量见 README「更名通告」；v1.1 原文存于 main 分支旧名下）。会诊处置：3/4 交付、24 项 adopted、1 项 pending 见 §7-4、明细见 §8。插件版本基线 0.3.0（rename 分支），DSH 0.1.5。
+> **状态**：v1.3（2026-09-17 设计评审 PASS，token d950e9c5…3209；10 条 advisory 全部折入：retire 语义 §3.3.2、tick 状态归属与自指拒绝 §3.2.4、pending 过期清扫与回退终态 §3.6.2、provisional 可见面三处 §3.6.2/§5.2、空缺寻址 §3.4、U2 补 dead 分支、数值上限 §4.1、P6 映射 §1.1、《调研》supersession 指针）。更名与 v1.2 沿革见 README「更名通告」。插件版本基线 0.3.0（rename 分支），DSH 0.1.5。
 
 ---
 
@@ -17,7 +17,7 @@
 | P3 | 指令竞态：发送方看不到接收方正在执行什么，无忙碌可见性 | §3.1/§3.5 |
 | P4 | 信任门禁阻塞：未配对直连超时按取消处理，无人值守无法建新通道 | §3.4/§3.6 |
 | P5 | 生命周期全手动：24h 内 5 次操作、每次 10–20 分钟、漏步即事故 | §3.6 |
-| P6 | 复盘观测性差：还原一次联调要人工拼 6 份日志 | §3.5/§3.7 |
+| P6 | 复盘观测性差：还原一次联调要人工拼 6 份日志 | §3.3.3/§3.4（M5 深化） |
 
 ### 1.2 DSH 0.1.5 源码验证事实（设计前提，全部已读源码核实）
 
@@ -198,7 +198,8 @@ function tickMessage(t, s) {                                   // 正文为插�
 
 team_link_watch(action: "register"|"list"|"clear", targets?, silentMinutes?, intervalMinutes?, ttlHours?)
 
-- register 仅允许 exec.agent.id === watcherSession（只能给自己注册）；
+- register 仅允许 exec.agent.id === watcherSession（只能给自己注册）；且**拒绝 watcherSession ∈ targets 的自指注册**（评审 #9：自指 = 变相自 tick 定时器，踩非目标 #5 与公理 A2）；
+- **tick 状态归属**（评审 #2 补）：recentlyTicked/markTicked 为插件进程内 Map，**不持久化**——重启即忘，语义 = 同一静默期最多一 tick，重启后若目标仍静默且超过去抖间隔则允许再 tick 一次（宁可一次多余 tick，不做持久状态）。markWatcherDead 同理只写信号面（list_sessions 展示 dead），不改注册；观察者代理在 TTL 内回归则 patrol 自然恢复投递，注册保留至 TTL 自清。
 - 防失控：单会话并发注册 <=3；silentMinutes >= 10、intervalMinutes >= 5、TTL <= 24h；tick 正文常量化（防 prompt 注入搭车）；
 - 与 goal 的关系（§7-7 落地）：观察者自身若 armed-active，goal 驱动器本就在续跑——patrol 对 running/armed-active 观察者直接跳过，与 A1 一致；对 active-but-disarmed 的目标按 goal-disarmed 告警（tick 文案含诊断与合规 resume 回路，B-4）；
 - 覆盖面诚实声明（A4/B-6/N6）：观察者或目标任一方关闭 = 不可达，watchdog 只在信号面标 dead 并等待用户；自 tick 引导采用 dsh-schedule 时须注意两条约束——overlay 需在会话创建前启用（存量会话无工具），reminder 不随 roster 迁移（换届时插件侧补迁移或新协调者重建）。
@@ -225,6 +226,7 @@ teams:
 #### 3.3.2 工具面
 
 - team_link_roster(action: "get"|"upsert-team"|"set-role"|"retire", team?, role?, session?, note?)
+- **retire 语义**（评审 #1 补）：仅由现任协调者会话或用户发起；效果 = 该角色 current 置空（vacant）+ history 追加带 note 的退役记录。retire 本身不动 pairs（它不携带信任授予）；但提供可选「顺带清理」：单个用户对话框列出全部指向退役会话的 pairs/trustedSenders/rememberTargets（复用 §3.6.1 原则 3 的对称撤销代码），勾选后清理。不清理也无安全洞（pairs 照旧过门），只是死数据堆积——选择权留给用户。
 - 写权限：policy.writer === "coordinator" 时仅 coordinator.current 会话可写（exec.agent.id 校验）；任何会话可读。settings UI 永远可改（用户是超级写者）。
 - set-role 副作用：若被替换会话存在 pairs，不自动迁移——迁移只发生在 rotation 流程（§3.6），避免绕过换届令牌。
 
@@ -251,7 +253,11 @@ function resolveTargets(expr, roster, caller): SessionId[] {
     require(caller === roster.coordinator.current);            // 全队广播仅协调者（策展价值，《调研》§5.3 论据 (a)）
     return allLiveMembers(roster, name);
   }
-  if (expr === "team:<name>/<role>") return [roster.role(role).current]; // 任何人可按角色点对点（仍过门）
+  if (expr === "team:<name>/<role>") {
+    const holder = roster.role(role).current;
+    if (holder === null) return [{ target: expr, outcome: "no-holder", detail: "该角色当前空缺" }]; // 评审 #7：空缺返回类型化结果，不投 [null]
+    return [holder];                                          // 任何人可按角色点对点（仍过门）
+  }
 }
 // fan-out = 循环现有 send 全路径（含双门、配对快路径、blocked 检查），单次 <=8 目标，
 // 每目标独立返回 {target, outcome: delivered|refused|no-agent, detail}
@@ -320,6 +326,19 @@ claim(team, role, token) {
     if (!ratified) scheduleProvisionalExpiry(team, role, 24h);  // TTL 到点：provisional pairs 自动删除 + 通知
   }
 }
+
+// 评审 #4 补：prepare 流产（令牌 30min 过期无人 claim）不得让 worker 永久冻结——
+// 过期清扫挂在 watchdog patrol 同一定时器上（定时 + roster 触碰时懒检查双保险）
+function sweepExpiredPendings() {
+  for (const p of expiredPendings(now)) {
+    roster[p.team][p.role].pending = null;
+    broadcast(p.team, ROTATION_CANCELLED(角色, 旧任仍为 current, "令牌过期未认领，解除冻结"));
+  }
+}
+// 评审 #5 补：provisional TTL 回退后的 roster 终态——新任保持 current（换届事实已成立，
+//   降格需用户显式操作），信任回退为过门投递；history 追加 "provisional 未批准过期"；pending 无残留。
+// 评审 #3 补：provisional 可见面 = 三处——ROTATION_DONE 广播文案、list_sessions 的 pairs 标记、
+//   send 走 provisional pair 时返回文案后缀 "（provisional 通道，24h 内未批准自动回退）"；信封 meta 不扩字段。
 ```
 
 #### 3.6.3 时序图
@@ -400,8 +419,8 @@ sequenceDiagram
 | broadcast fan-out | 全队通配仅协调者；逐目标照走双门，fan-out 不放宽任何门（V8）；单次 fan-out <=8 目标 |
 | rotation 自动迁移 pairs | 令牌一次性且绑定 (team,role,successor)，claim 幂等 + 团队域限定 + 单对话框逐项勾选/整批确认或 provisional+TTL 回退 + 10min 速率限制 + rotationBackup 可撤销 + 授予与撤销对称（退役者持有的 pairs/trustedSenders/rememberTargets 同步吊销） |
 | roster 写入 | writer 策略（默认仅协调者会话）；用户经 settings 永远可写 |
-| 信封 meta | 仅 4 个枚举 type + 3 级 pri + ref 短串；渲染进 banner 首行，不扩 source（V10） |
-| 黑板写 | decisions 只追加；discipline 乐观锁；单行长度上限（防黑板刷屏污染） |
+| 信封 meta | 仅 4 个枚举 type + 3 级 pri + ref 短串（≤16 字符，超长截断）；渲染进 banner 首行，不扩 source（V10） |
+| 黑板写 | decisions 只追加；discipline 乐观锁；单行长度上限 **500 字符**（防黑板刷屏污染） |
 
 ### 4.2 模型行为防偏离（把《调研》§2.3 的自发纪律固化为机制）
 
@@ -423,7 +442,7 @@ sequenceDiagram
 | # | 断言 | 覆盖 |
 |---|---|---|
 | U1 | verdict 五态判定表（ok/goal-disarmed/silent-idle/long-running/dead，含 paused/blocked→ok 展示、goals 服务缺失降级） | §3.1 |
-| U2 | patrol 四态策略：观察者 running/armed-active→不 tick；目标 armed-active→不 tick；goal-disarmed→立即 tick 且载荷含诊断与 resume 回路文案；paused/blocked→不 tick；silent-idle→tick 恰一次（fake timers） | §3.2/§3.7 |
+| U2 | patrol 四态策略：观察者 running/armed-active→不 tick；目标 armed-active→不 tick；goal-disarmed→立即 tick 且载荷含诊断与 resume 回路文案；paused/blocked→不 tick；silent-idle→tick 恰一次（fake timers）；**观察者代理不存在→不 tick、信号面标 dead、注册保留至 TTL**（评审 #8 补） | §3.2/§3.7 |
 | U3 | tick 消息 source 三成员合规 + 正文与注册参数无关（常量化；goal-disarmed 载荷仅状态字段插值） | §3.2.3/V10 |
 | U4 | roster 写权限：非协调者会话 set-role 拒绝；upsert-team 幂等 | §3.3 |
 | U5 | resolveTargets：通配仅协调者；fan-out 每目标独立过门（unpaired+无确认服务→逐目标 fail-closed，不因批量放宽） | §3.4/V8 |
@@ -435,7 +454,7 @@ sequenceDiagram
 
 1. **P1 复现→解除**：会话 A（无 goal）发指令后静默 >=10min → 看门狗 tick A → A 轮询 list_sessions 发现 B verdict=silent-idle → A 主动 nudge。全程无人工。
 2. **goal 互不打扰**：A 建 goal（armed）后看门狗不再 tick A；A 的 goal 轮正常续跑（日志 goal_round 连续同号递增）。
-3. **换届夜航**：C1 prepare→C2 claim（无用户确认）→ workers 收到 freeze/done 通知 → C2 可发消息（banner 标 provisional）→ 模拟 24h 到点未批准 → pairs 回退 + C2 发送恢复过门。
+3. **换届夜航**：C1 prepare→C2 claim（无用户确认）→ workers 收到 freeze/done 通知 → C2 可发消息（**send 返回文案标 provisional**）→ 模拟 24h 到点未批准 → pairs 回退 + C2 发送恢复过门 + roster history 记 "provisional 未批准过期"（评审 #3 修正：banner 不承载 provisional，验证面为 send 返回/广播/list_sessions）。
 4. **换届白航**：同上但用户在场单次确认 → pairs 正式迁移 + 旧 pairs/trustedSenders 清理 + roster.md 镜像一致。
 5. **广播策展**：worker 尝试 team:night/* → 拒绝；协调者发 → 三 worker 各自独立过门投递。
 6. **审计自包含**：export 任一参与会话，信封首行（type/pri/ref）在 md 导出中完整可读。

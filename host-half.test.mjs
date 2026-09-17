@@ -4,8 +4,9 @@
 // then exercises the three -pro tools against stubbed services.
 // Run after the node_modules junctions are in place (see README).
 import { Context } from "@deepseek-ai/cordis";
-import { rmSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { existsSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { apply, __testing } from "./lib/index.js";
 
@@ -21,12 +22,12 @@ function check(label, cond) {
 
 const CWD = "C:/dev/demo";
 
-function makeSenderAgent(status) {
+function makeSenderAgent(status, cwd = CWD) {
 	const calls = { injected: [], steered: [], followedup: [] };
 	const agent = {
 		id: "session-self",
 		status,
-		session: { header: { id: "session-self", cwd: CWD } },
+		session: { header: { id: "session-self", cwd } },
 		inject(message) { calls.injected.push(message); },
 		steer(message) { calls.steered.push(message); },
 		followup(message) { calls.followedup.push(message); },
@@ -106,7 +107,7 @@ function makeQuery(sessions, eventsBySession = {}) {
 }
 
 /** Build a full plugin environment on a fresh cordis Context. */
-function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false } = {}) {
+function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, selfCwd, omitUserQuestions = false } = {}) {
 	const ctx = new Context();
 	const prepared = [];
 	let failWith = null;
@@ -122,7 +123,7 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 	};
 	const registeredTools = [];
 	const routes = [];
-	const { agent: senderAgent, calls: senderCalls } = makeSenderAgent(selfStatus);
+	const { agent: senderAgent, calls: senderCalls } = makeSenderAgent(selfStatus, selfCwd ?? CWD);
 	const { agent: targetAgent, calls: targetCalls } = makeTargetAgent(targetStatus);
 	const runnerAgent = { id: "session-runner", status: "running", session: { header: { id: "session-runner", cwd: CWD } } };
 	const extraAgentObjects = extraAgents.map((entry) => ({ id: entry.id, status: entry.status, session: { header: { id: entry.id, cwd: CWD } } }));
@@ -145,7 +146,9 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 	ctx.provide("tools", { register(tool) { registeredTools.push(tool); return () => {}; } });
 	ctx.provide("sessionQuery", makeQuery(sessions, eventsBySession));
 	ctx.provide("agents", agents);
-	ctx.provide("userQuestions", uq.service);
+	// `omitUserQuestions` models a shell without the confirmation service (the
+	// M2 retirement cleanup and the M1 send gates must both degrade, not crash).
+	if (!omitUserQuestions) ctx.provide("userQuestions", uq.service);
 	ctx.provide("webServer", { register(route) { routes.push(route); return () => {}; } });
 	if (settings !== undefined) ctx.provide("settings", settings.service);
 	// The `goals` service is optional by design (§3.1): absent here means the
@@ -830,8 +833,280 @@ check("the effect disposer clears every patrol timer (§3.2.4 / task cleanup rul
 await disposeEnv.watchdog.patrol({ now: WD_NOW });
 check("after dispose the patrol is inert (no tick)", disposeEnv.senderCalls.followedup.length === 0);
 
+// ---------------------------------------------------------------------------
+// M2 (§3.3.1/§3.3.2): roster — writer policy, version history, retirement, mirror
+// ---------------------------------------------------------------------------
+
+const TEAM_TMP = path.resolve(".test-tmp-team");
+const TEAM_WS = path.join(TEAM_TMP, "ws");
+rmSync(TEAM_TMP, { recursive: true, force: true });
+
+/** One roster row as the user would write it in the settings UI — the only path
+ * that can seat a team's first coordinator, because a vacant coordinator refuses
+ * every session-side write (§3.3.2). */
+function teamRow({ name = "night-shift", writer = "coordinator", current = "session-self", workspace = TEAM_WS, roles } = {}) {
+	return {
+		name,
+		createdAt: 1_700_000_000_000,
+		workspace,
+		policy: { writer },
+		roles: roles ?? [{
+			role: "coordinator",
+			current,
+			pending: null,
+			history: current === null ? [] : [{ session: current, from: 1_700_000_000_000, until: null }],
+		}],
+	};
+}
+
+/** A plugin environment whose `team-link` namespace is seeded with a roster.
+ * `selfCwd` points the caller at the throwaway workspace the blackboard lives in. */
+function teamEnv({ teams = [], askScript = [], omitUserQuestions = false, selfCwd = TEAM_WS, extraAgents = [] } = {}) {
+	const env = setup({ sessions: [], useSettings: true, askScript, selfCwd, omitUserQuestions, extraAgents });
+	const ns = env.settings.namespaces.get("team-link");
+	ns.data.teams = structuredClone(teams);
+	return { ...env, ns, store: () => ns.data.teams };
+}
+
+/** Argument-schema violations surface as a thrown ToolArgsError, not a string. */
+const rejects = async (tool, args, exec) => {
+	try {
+		return await tool.execute(args, exec);
+	} catch (error) {
+		return error;
+	}
+};
+
+const teamStore = (env) => env.store();
+
+// --- upsert-team: creation, validation, workspace capture --------------------
+const createEnv = teamEnv({ teams: [] });
+const createRoster = createEnv.tool("team_link_roster");
+check("M2: the roster and blackboard tools are registered", ["team_link_roster", "team_link_team_read", "team_link_team_append"].every((toolName) => createEnv.tool(toolName) !== undefined));
+
+const listEmpty = await createRoster.execute({ action: "get" }, execFor(createEnv.senderAgent));
+check("roster get on an empty registry says so instead of failing", listEmpty.includes("团队注册表（共 0 个团队）") && listEmpty.includes("（无团队"));
+
+const createOut = await createRoster.execute({ action: "upsert-team", team: "night-shift" }, execFor(createEnv.senderAgent));
+check("upsert-team creates the team with the default writer policy and the caller's workspace (§3.3.1)", createOut.includes("已创建团队 night-shift") && createOut.includes("policy.writer=coordinator") && teamStore(createEnv).length === 1 && teamStore(createEnv)[0].workspace === TEAM_WS && teamStore(createEnv)[0].createdAt > 0);
+const mirrorFile = path.join(TEAM_WS, "team", "night-shift", "roster.md");
+check("the roster mirror is written in the same call (§3.3.1 人可读镜像)", existsSync(mirrorFile));
+const mirrorText = await readFile(mirrorFile, "utf8");
+check("the mirror is readable and names the settings namespace as the source of truth", mirrorText.includes("# 团队 roster：night-shift") && mirrorText.includes("policy.writer：coordinator") && mirrorText.includes("事实源"));
+
+const traversalName = await createRoster.execute({ action: "upsert-team", team: "night/shift" }, execFor(createEnv.senderAgent));
+check("upsert-team refuses a name outside [a-z0-9-]+ (path traversal, §3.3.1)", traversalName.includes("非法") && traversalName.includes("路径穿越") && teamStore(createEnv).length === 1 && !existsSync(path.join(TEAM_WS, "team", "night")));
+const dotName = await createRoster.execute({ action: "upsert-team", team: ".." }, execFor(createEnv.senderAgent));
+check("upsert-team refuses a dotted name too", dotName.includes("非法") && teamStore(createEnv).length === 1);
+const upperName = await createRoster.execute({ action: "upsert-team", team: "NightShift" }, execFor(createEnv.senderAgent));
+check("the name charset is lowercase-only as specified", upperName.includes("非法") && teamStore(createEnv).length === 1);
+const noAgentCreate = await createRoster.execute({ action: "upsert-team", team: "day-shift" }, { signal: new AbortController().signal });
+check("upsert-team without a live agent is refused — the workspace must come from a real agentCwd", noAgentCreate.includes("需要可交互的活动代理") && teamStore(createEnv).length === 1);
+
+const vacantSetRole = await createRoster.execute({ action: "set-role", team: "night-shift", role: "coordinator", session: "session-self" }, execFor(createEnv.senderAgent));
+check("U4: set-role is refused for every session while coordinator.current is null — the settings UI is the writable path", vacantSetRole.includes("当前空缺") && vacantSetRole.includes("设置 UI") && teamStore(createEnv)[0].roles.length === 0);
+const vacantUpsert = await createRoster.execute({ action: "upsert-team", team: "night-shift" }, execFor(createEnv.senderAgent));
+check("U4: an existing team answers upsert-team with the same writer gate", vacantUpsert.includes("当前空缺") && teamStore(createEnv).length === 1);
+
+// --- U4: writer policy on a seated team -------------------------------------
+const permEnv = teamEnv({ teams: [teamRow({ current: "session-self" })] });
+const permRoster = permEnv.tool("team_link_roster");
+const foreignExec = () => execFor(permEnv.targetAgent);
+const foreignSetRole = await permRoster.execute({ action: "set-role", team: "night-shift", role: "coordinator", session: "session-target" }, foreignExec());
+check("U4: a non-coordinator session cannot set-role under writer=coordinator", foreignSetRole.includes("只有现任协调者会话 session-self 可写") && teamStore(permEnv)[0].roles[0].current === "session-self");
+
+const ownSetRole = await permRoster.execute({ action: "set-role", team: "night-shift", role: "coordinator", session: "session-target", note: "交接给夜班" }, execFor(permEnv.senderAgent));
+check("U4: the incumbent coordinator session can set-role", ownSetRole.includes("已设置") && teamStore(permEnv)[0].roles[0].current === "session-target");
+const history1 = teamStore(permEnv)[0].roles[0].history;
+check("U4: set-role closes the previous tenure (until=now, note) and appends the new one open (§3.3.2)", history1.length === 2 && history1[0].session === "session-self" && typeof history1[0].until === "number" && history1[0].note === "交接给夜班" && history1[1].session === "session-target" && history1[1].until === null && history1[1].from >= history1[0].until && history1[1].note === undefined);
+check("set-role does not migrate pairs — that is rotation's exclusive action (§3.3.2)", !ownSetRole.includes("已迁移") && permEnv.ns.data.pairs === undefined);
+const staleWriter = await permRoster.execute({ action: "set-role", team: "night-shift", role: "coordinator", session: "session-self" }, execFor(permEnv.senderAgent));
+check("after the hand-over the OLD incumbent can no longer write (the gate follows current)", staleWriter.includes("只有现任协调者会话 session-target 可写"));
+const newWriter = await permRoster.execute({ action: "set-role", team: "night-shift", role: "coordinator", session: "session-self" }, foreignExec());
+check("the new incumbent writes from its own session id", newWriter.includes("已设置") && teamStore(permEnv)[0].roles[0].current === "session-self");
+
+const anyEnv = teamEnv({ teams: [teamRow({ writer: "any", current: "session-self" })] });
+const anySetRole = await anyEnv.tool("team_link_roster").execute({ action: "set-role", team: "night-shift", role: "reviewer", session: "session-target" }, execFor(anyEnv.targetAgent));
+check("U4: writer=any admits any session — and set-role creates a role that did not exist", anySetRole.includes("已设置") && teamStore(anyEnv).length === 1 && teamStore(anyEnv)[0].roles.length === 2 && teamStore(anyEnv)[0].roles[1].role === "reviewer" && teamStore(anyEnv)[0].roles[1].current === "session-target");
+
+const idemEnv = teamEnv({ teams: [teamRow({ writer: "any", current: "session-self" })] });
+await idemEnv.tool("team_link_roster").execute({ action: "set-role", team: "night-shift", role: "reviewer", session: "session-target", note: "评审岗" }, execFor(idemEnv.senderAgent));
+const beforeIdempotent = structuredClone(teamStore(idemEnv)[0]);
+const idemOut = await idemEnv.tool("team_link_roster").execute({ action: "upsert-team", team: "night-shift" }, execFor(idemEnv.senderAgent));
+check("U4: upsert-team is idempotent — roles, history and createdAt are not reset", idemOut.includes("已存在") && idemOut.includes("幂等") && JSON.stringify(teamStore(idemEnv)[0].roles) === JSON.stringify(beforeIdempotent.roles) && teamStore(idemEnv)[0].createdAt === beforeIdempotent.createdAt && teamStore(idemEnv)[0].workspace === beforeIdempotent.workspace);
+check("U4: upsert-team leaves the stored policy alone (the tool has no policy parameter)", JSON.stringify(teamStore(idemEnv)[0].policy) === JSON.stringify({ writer: "any" }));
+
+const captureEnv = teamEnv({ teams: [teamRow({ writer: "any", workspace: "" })] });
+const captureOut = await captureEnv.tool("team_link_roster").execute({ action: "upsert-team", team: "night-shift" }, execFor(captureEnv.senderAgent));
+check("upsert-team captures the workspace of a settings-created team that has none yet", captureOut.includes("补记") && teamStore(captureEnv)[0].workspace === TEAM_WS);
+
+// --- U4: retirement and its optional trust cleanup --------------------------
+const retireEnv = teamEnv({ teams: [teamRow({ current: "session-self" })], askScript: ["清理"] });
+retireEnv.ns.data.pairs = [{ a: "session-self", b: "session-target", createdAt: 1 }, { a: "session-child", b: "session-other", createdAt: 2 }];
+retireEnv.ns.data.trustedSenders = ["session-self"];
+retireEnv.ns.data.rememberTargets = ["session-self", "session-target"];
+const retireRoster = retireEnv.tool("team_link_roster");
+const retireForeign = await retireRoster.execute({ action: "retire", team: "night-shift", role: "coordinator" }, foreignExec());
+check("U4: retire is refused for a non-coordinator session (§3.3.2 v1.3 仅现任协调者会话或用户发起)", retireForeign.includes("只有现任协调者会话 session-self 可以发起退役") && teamStore(retireEnv)[0].roles[0].current === "session-self");
+const anyRetireEnv = teamEnv({ teams: [teamRow({ writer: "any", current: "session-self" })] });
+const anyRetireForeign = await anyRetireEnv.tool("team_link_roster").execute({ action: "retire", team: "night-shift", role: "coordinator" }, execFor(anyRetireEnv.targetAgent));
+check("retire stays with the incumbent coordinator even under writer=any (the clause names the coordinator, not the policy)", anyRetireForeign.includes("只有现任协调者会话 session-self 可以发起退役") && teamStore(anyRetireEnv)[0].roles[0].current === "session-self");
+const retireOut = await retireRoster.execute({ action: "retire", team: "night-shift", role: "coordinator", note: "下班交班" }, execFor(retireEnv.senderAgent));
+check("U4: retire empties current and records the retirement in the version history", retireOut.includes("已退役") && teamStore(retireEnv)[0].roles[0].current === null && teamStore(retireEnv)[0].roles[0].history.length === 1 && typeof teamStore(retireEnv)[0].roles[0].history[0].until === "number" && teamStore(retireEnv)[0].roles[0].history[0].note === "下班交班");
+check("retire does not touch trust data on its own — the cleanup is the user's call", retireEnv.uq.requests.length === 1 && retireEnv.uq.requests[0].questions[0].id === "retire-cleanup" && retireEnv.uq.requests[0].agent === retireEnv.senderAgent);
+const retireQuestion = retireEnv.uq.requests[0].questions[0].question;
+check("the retirement dialog lists every reference to the retired session, both directions", retireQuestion.includes("session-self ↔ session-target") && !retireQuestion.includes("session-child ↔ session-other") && retireQuestion.includes("trustedSenders") && retireQuestion.includes("rememberTargets") && retireQuestion.includes("pairs"));
+check("U4: confirming the dialog cleans exactly the references pointing at the retired session", retireOut.includes("已清理") && retireEnv.ns.data.pairs.length === 1 && retireEnv.ns.data.pairs[0].a === "session-child" && retireEnv.ns.data.trustedSenders.length === 0 && retireEnv.ns.data.rememberTargets.join(",") === "session-target");
+check("retire leaves the role vacant and the mirror agrees", teamStore(retireEnv)[0].roles[0].current === null && (await readFile(mirrorFile, "utf8")).length > 0);
+
+const keepEnv = teamEnv({ teams: [teamRow({ current: "session-self" })], askScript: ["保留"] });
+keepEnv.ns.data.pairs = [{ a: "session-self", b: "session-target", createdAt: 1 }];
+const keepOut = await keepEnv.tool("team_link_roster").execute({ action: "retire", team: "night-shift", role: "coordinator" }, execFor(keepEnv.senderAgent));
+check("U4: choosing 保留 keeps every trust reference untouched", keepOut.includes("已保留") && keepEnv.ns.data.pairs.length === 1 && teamStore(keepEnv)[0].roles[0].current === null);
+
+const noRefEnv = teamEnv({ teams: [teamRow({ current: "session-self" })] });
+const noRefOut = await noRefEnv.tool("team_link_roster").execute({ action: "retire", team: "night-shift", role: "coordinator" }, execFor(noRefEnv.senderAgent));
+check("with nothing pointing at the retired session there is no dialog at all", noRefEnv.uq.requests.length === 0 && noRefOut.includes("无需清理") && teamStore(noRefEnv)[0].roles[0].current === null);
+
+const noUqEnv = teamEnv({ teams: [teamRow({ current: "session-self" })], omitUserQuestions: true });
+noUqEnv.ns.data.pairs = [{ a: "session-self", b: "session-target", createdAt: 1 }];
+const noUqOut = await noUqEnv.tool("team_link_roster").execute({ action: "retire", team: "night-shift", role: "coordinator" }, execFor(noUqEnv.senderAgent));
+check("without the confirmation service retire still completes and reports the skipped cleanup", noUqOut.includes("确认服务（userQuestions）不可用") && noUqOut.includes("已退役") && noUqEnv.ns.data.pairs.length === 1 && teamStore(noUqEnv)[0].roles[0].current === null);
+
+// --- reads are open, detail carries the version history ---------------------
+const detailEnv = teamEnv({ teams: [teamRow({ current: "session-self" })] });
+await detailEnv.tool("team_link_roster").execute({ action: "set-role", team: "night-shift", role: "reviewer", session: "session-target", note: "评审岗" }, execFor(detailEnv.senderAgent));
+const detailOut = await detailEnv.tool("team_link_roster").execute({ action: "get", team: "night-shift" }, foreignExec());
+check("roster get is readable by any session (the write gate does not gate reads)", detailOut.includes("角色 coordinator：现任 session-self") && detailOut.includes("角色 reviewer：现任 session-target") && detailOut.includes("评审岗") && detailOut.includes("→ 现任"));
+check("the detail view reports the blackboard root", detailOut.includes(path.join(TEAM_WS, "team", "night-shift")));
+const summaryOut = await detailEnv.tool("team_link_roster").execute({ action: "get" }, foreignExec());
+check("roster get without a team returns the registry summary only", summaryOut.includes("团队注册表（共 1 个团队）") && !summaryOut.includes("版本史（共"));
+
+// --- the mirror is best-effort: a failure never blocks the settings write ----
+const mirrorEnv = teamEnv({ teams: [teamRow({ writer: "any", current: "session-self" })] });
+const mirrorLineNote = `${"n".repeat(3)} 备注带 emoji 🔵`;
+await mirrorEnv.tool("team_link_roster").execute({ action: "set-role", team: "night-shift", role: "reviewer", session: "session-target", note: mirrorLineNote }, execFor(mirrorEnv.senderAgent));
+const writtenMirror = await readFile(mirrorFile, "utf8");
+check("the mirror agrees with the settings source of truth (role, incumbent, note)", writtenMirror.includes("### reviewer") && writtenMirror.includes("现任：session-target") && writtenMirror.includes("🔵"));
+check("the mirror is well-formed (no lone surrogate leaves the plugin)", !hasLone(writtenMirror));
+
+const blockedRoot = path.join(TEAM_TMP, "blocked-root");
+await writeFile(blockedRoot, "not a directory", "utf8");
+const blockedEnv = teamEnv({ teams: [teamRow({ name: "blocked-team", writer: "any", workspace: blockedRoot })] });
+const blockedMirrorOut = await blockedEnv.tool("team_link_roster").execute({ action: "set-role", team: "blocked-team", role: "reviewer", session: "session-target" }, execFor(blockedEnv.senderAgent));
+check("a mirror-write failure is a warning only — the settings change still lands (§3.3.1 best-effort)", blockedMirrorOut.includes("已设置") && blockedMirrorOut.includes("镜像写入失败") && blockedMirrorOut.includes("settings 是本插件的事实源") && teamStore(blockedEnv)[0].roles.some((entry) => entry.role === "reviewer" && entry.current === "session-target"));
+check("the failed mirror leaves no half-written file", !existsSync(path.join(blockedRoot, "team", "blocked-team", "roster.md")));
+// ---------------------------------------------------------------------------
+// M2 (§3.3.3): the team blackboard — decisions ledger + discipline lock
+// ---------------------------------------------------------------------------
+
+const boardDir = path.join(TEAM_WS, "team", "night-shift");
+const decisionsPath = path.join(boardDir, "decisions.md");
+const disciplinePath = path.join(boardDir, "discipline.md");
+/** Independent re-implementation of the plugin hash, so the tests check the
+ * discipline lock against the file content rather than against itself. */
+const hashOf = (text) => createHash("sha256").update(text, "utf8").digest("hex").slice(0, 16);
+const decisionsHashOf = (out) => {
+	const start = out.indexOf("--- decisions.md");
+	const end = out.indexOf("--- discipline.md");
+	if (start === -1 || end === -1) return "";
+	const matched = /baseHash=([0-9a-f]{16})/u.exec(out.slice(start, end));
+	return matched === null ? "" : matched[1];
+};
+const disciplineHashOf = (out) => {
+	const start = out.indexOf("--- discipline.md");
+	if (start === -1) return "";
+	const matched = /baseHash=([0-9a-f]{16})/u.exec(out.slice(start));
+	return matched === null ? "" : matched[1];
+};
+
+const boardEnv = teamEnv({ teams: [teamRow({ current: "session-self" })] });
+const boardRead = boardEnv.tool("team_link_team_read");
+const boardAppend = boardEnv.tool("team_link_team_append");
+rmSync(decisionsPath, { force: true });
+rmSync(disciplinePath, { force: true });
+
+const freshRead = await boardRead.execute({ team: "night-shift" }, execFor(boardEnv.targetAgent));
+check("team_read is open to any session and reports absent files honestly instead of failing", freshRead.includes("团队 night-shift 黑板") && freshRead.includes("（文件不存在，按空处理：0 条）") && freshRead.includes("（文件不存在，按空处理）baseHash=") && freshRead.includes("（空）"));
+check("team_read hands back a baseHash for both files even when they are absent", (freshRead.match(/baseHash=[0-9a-f]{16}/gu) ?? []).length === 2 && freshRead.includes(`baseHash=${hashOf("")}`));
+check("team_read carries the roster summary (writer policy + roles)", freshRead.includes("policy.writer=coordinator") && freshRead.includes("角色 coordinator：现任 session-self"));
+
+// --- decisions: append-only ledger with a plugin-assigned seq ----------------
+const dec1 = await boardAppend.execute({ team: "night-shift", file: "decisions", line: "统一用 team_link_send 汇报" }, execFor(boardEnv.senderAgent));
+const ledger1 = (await readFile(decisionsPath, "utf8")).trim().split("\n");
+check("decisions append writes exactly the documented row (§3.3.3)", ledger1.length === 1 && /^1 \| \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \| session-self \| 统一用 team_link_send 汇报$/u.test(ledger1[0]) && dec1.includes("已追加 decisions #1"));
+const dec2 = await boardAppend.execute({ team: "night-shift", file: "decisions", line: "冲突升级给协调者" }, execFor(boardEnv.targetAgent));
+const ledger2 = (await readFile(decisionsPath, "utf8")).trim().split("\n");
+check("decisions seq is monotonic and plugin-assigned, and any session may write it", ledger2.length === 2 && ledger2[1].startsWith("2 | ") && ledger2[1].includes("| session-target | 冲突升级给协调者") && dec2.includes("已追加 decisions #2"));
+check("the ledger is append-only — the earlier row is byte-identical", ledger2[0] === ledger1[0]);
+
+const tooLongDecision = await boardAppend.execute({ team: "night-shift", file: "decisions", line: "长".repeat(501) }, execFor(boardEnv.senderAgent));
+check("a decisions line past the 500-character cap is refused and nothing is written (§4.1)", tooLongDecision.includes("超过单行上限 500") && tooLongDecision.includes("§4.1") && (await readFile(decisionsPath, "utf8")).trim().split("\n").length === 2);
+const atCap = await boardAppend.execute({ team: "night-shift", file: "decisions", line: "长".repeat(500) }, execFor(boardEnv.senderAgent));
+check("exactly 500 characters is accepted — the cap is inclusive", atCap.includes("已追加 decisions #3"));
+const multiLine = await boardAppend.execute({ team: "night-shift", file: "decisions", line: "第一行\n第二行" }, execFor(boardEnv.senderAgent));
+check("a multi-line decision is refused — the ledger is one row per line", multiLine.includes("必须单行") && (await readFile(decisionsPath, "utf8")).trim().split("\n").length === 3);
+const emojiDecision = await boardAppend.execute({ team: "night-shift", file: "decisions", line: "🔵".repeat(400) }, execFor(boardEnv.senderAgent));
+check("the cap counts code points, not UTF-16 units (400 astral characters = 800 units)", emojiDecision.includes("已追加 decisions #4"));
+
+// A file whose last append was interrupted before its terminator must not merge
+// the new row into the old one, and the seq still follows the file's maximum.
+await writeFile(decisionsPath, "7 | 2026-01-01T00:00:00.000Z | session-other | 手工补写的行", "utf8");
+const repaired = await boardAppend.execute({ team: "night-shift", file: "decisions", line: "补一行" }, execFor(boardEnv.senderAgent));
+const repairedRows = (await readFile(decisionsPath, "utf8")).split("\n").filter((row) => row.trim() !== "");
+check("an unterminated last row is repaired, not merged, and the seq follows the file's maximum", repaired.includes("已追加 decisions #8") && repairedRows.length === 2 && repairedRows[0].startsWith("7 | ") && repairedRows[1].startsWith("8 | "));
+
+// --- discipline: whole-file replace behind the baseHash optimistic lock ------
+const hashA = disciplineHashOf(freshRead);
+const disc1 = await boardAppend.execute({ team: "night-shift", file: "discipline", line: "第一版：汇报走 team_link_send", baseHash: hashA }, execFor(boardEnv.senderAgent));
+check("discipline replace with team_read's baseHash succeeds (optimistic lock)", disc1.includes("已替换 discipline.md") && (await readFile(disciplinePath, "utf8")) === "第一版：汇报走 team_link_send");
+check("the result announces the new baseHash the next writer must carry", disc1.includes(`baseHash ${hashOf("第一版：汇报走 team_link_send")} →`) || disc1.includes(hashOf("第一版：汇报走 team_link_send")));
+const staleDisc = await boardAppend.execute({ team: "night-shift", file: "discipline", line: "第二版（并发覆盖）", baseHash: hashA }, execFor(boardEnv.targetAgent));
+check("a stale baseHash is refused, the file is untouched, and a re-read is demanded (§3.3.3 乐观锁)", staleDisc.includes("baseHash 不匹配") && staleDisc.includes("重新 team_link_team_read") && (await readFile(disciplinePath, "utf8")) === "第一版：汇报走 team_link_send");
+const missingHash = await boardAppend.execute({ team: "night-shift", file: "discipline", line: "第二版" }, execFor(boardEnv.senderAgent));
+check("discipline without a baseHash is refused", missingHash.includes("必须携带") && (await readFile(disciplinePath, "utf8")) === "第一版：汇报走 team_link_send");
+const reread = await boardRead.execute({ team: "night-shift" }, execFor(boardEnv.senderAgent));
+const hashB = disciplineHashOf(reread);
+check("team_read hands back the hash of the current content after a change", hashB === hashOf("第一版：汇报走 team_link_send") && hashB !== hashA && decisionsHashOf(reread) === hashOf(await readFile(decisionsPath, "utf8")));
+const disc2 = await boardAppend.execute({ team: "night-shift", file: "discipline", line: "第二版：改由 reviewer 汇总", baseHash: hashB }, execFor(boardEnv.targetAgent));
+check("a re-read followed by the fresh baseHash succeeds (the two-worker flow §3.3.3 exists for)", disc2.includes("已替换 discipline.md") && (await readFile(disciplinePath, "utf8")) === "第二版：改由 reviewer 汇总");
+const longDiscipline = await boardAppend.execute({ team: "night-shift", file: "discipline", line: `短行\n${"长".repeat(501)}`, baseHash: hashOf("第二版：改由 reviewer 汇总") }, execFor(boardEnv.senderAgent));
+check("discipline content carries the same per-line 500-character cap", longDiscipline.includes("第 2 行超过单行上限 500") && (await readFile(disciplinePath, "utf8")) === "第二版：改由 reviewer 汇总");
+const clearDiscipline = await boardAppend.execute({ team: "night-shift", file: "discipline", line: "", baseHash: hashOf("第二版：改由 reviewer 汇总") }, execFor(boardEnv.senderAgent));
+check("an empty replacement is accepted — discipline is a whole-file replace", clearDiscipline.includes("已替换 discipline.md") && (await readFile(disciplinePath, "utf8")) === "");
+
+// --- the read window, the author field, and the guards ----------------------
+const windowEnv = teamEnv({ teams: [teamRow({ writer: "any" })] });
+const windowAppend = windowEnv.tool("team_link_team_append");
+rmSync(decisionsPath, { force: true });
+for (let n = 1; n <= 25; n += 1) {
+	await windowAppend.execute({ team: "night-shift", file: "decisions", line: `第 ${n} 条裁决` }, execFor(windowEnv.targetAgent));
+}
+const windowOut = await windowEnv.tool("team_link_team_read").execute({ team: "night-shift" }, execFor(windowEnv.senderAgent));
+check("team_read shows only the trailing 20 decisions of 25 (§3.3.3 K=20)", windowOut.includes("共 25 条，显示 20 条") && windowOut.includes("| 第 6 条裁决") && windowOut.includes("| 第 25 条裁决") && !windowOut.includes("| 第 5 条裁决"));
+check("the window keeps the plugin-assigned seq visible", windowOut.includes("6 | ") && windowOut.includes("25 | "));
+const anonAppend = await windowAppend.execute({ team: "night-shift", file: "decisions", line: "无会话身份的写入" }, { signal: new AbortController().signal });
+check("the blackboard has no write gate: a caller without a session identity still writes, recorded honestly as author=unknown", anonAppend.includes("已追加 decisions #26") && anonAppend.includes("author=unknown") && (await readFile(decisionsPath, "utf8")).includes("| unknown | 无会话身份的写入"));
+
+const unknownRead = await boardRead.execute({ team: "no-such-team" }, execFor(boardEnv.senderAgent));
+check("team_read on an unregistered team refuses with the bootstrap hint", unknownRead.includes("不在注册表中") && unknownRead.includes("upsert-team"));
+const unknownAppend = await boardAppend.execute({ team: "no-such-team", file: "decisions", line: "x" }, execFor(boardEnv.senderAgent));
+check("team_append on an unregistered team refuses", unknownAppend.includes("不在注册表中"));
+const badFile = await rejects(boardAppend, { team: "night-shift", file: "roster", line: "x" }, execFor(boardEnv.senderAgent));
+check("the file argument is an enum — no other blackboard file can be addressed", badFile instanceof Error && badFile.message.includes("file"));
+const pathFile = await rejects(boardAppend, { team: "night-shift", file: "../discipline", line: "x" }, execFor(boardEnv.senderAgent));
+check("a path-shaped file argument dies on the same enum (no traversal through file)", pathFile instanceof Error && pathFile.message.includes("file") && !existsSync(path.join(TEAM_WS, "team", "discipline.md")));
+const traversalTeam = await boardRead.execute({ team: "../etc" }, execFor(boardEnv.senderAgent));
+check("the team name is validated before it ever reaches a path", traversalTeam.includes("非法"));
+
+const noWsEnv = teamEnv({ teams: [teamRow({ workspace: "" })] });
+const noWsRead = await noWsEnv.tool("team_link_team_read").execute({ team: "night-shift" }, execFor(noWsEnv.senderAgent));
+check("a team with no captured workspace reports the blackboard unusable instead of guessing a root", noWsRead.includes("没有 workspace 记录"));
+const noWsAppend = await noWsEnv.tool("team_link_team_append").execute({ team: "night-shift", file: "decisions", line: "x" }, execFor(noWsEnv.senderAgent));
+check("team_append refuses the same way without a workspace root", noWsAppend.includes("没有 workspace 记录"));
 // cleanup
 rmSync(tmpDir, { recursive: true, force: true });
+rmSync(TEAM_TMP, { recursive: true, force: true });
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

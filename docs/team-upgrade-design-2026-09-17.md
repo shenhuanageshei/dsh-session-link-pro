@@ -1,8 +1,8 @@
-# dsh-session-link-pro 团队升级设计文档（2026-09-17）
+# dsh-team-link 团队升级设计文档（2026-09-17）
 
 > **文档用途**：本文档是 `team-upgrade-research-2026-09-17.md`（下称《调研》）§5 提案的实施级修正设计。对《调研》§7 议题的裁决、DSH 0.1.5 源码验证事实、会诊 #27 的意见处置记录在 §1.2 / §8。机制均带伪代码与 schema；验收标准对齐仓库既有测试形态（`host-half.test.mjs`）。
 >
-> **状态**：v1.1 定稿（2026-09-17 会诊 #27 整合完毕：3/4 交付、24 项 adopted、1 项 pending 见 §7-4、处置明细见 §8）。插件版本基线 0.2.4，DSH 0.1.5。
+> **状态**：v1.2（2026-09-17 会诊 #27 整合完毕后，随 0.3.0 更名 `dsh-team-link` 同批更新工具名为 `team_link_*`；更名决策与不变量见 README「更名通告」；v1.1 原文存于 main 分支旧名下）。会诊处置：3/4 交付、24 项 adopted、1 项 pending 见 §7-4、明细见 §8。插件版本基线 0.3.0（rename 分支），DSH 0.1.5。
 
 ---
 
@@ -85,7 +85,7 @@ roster（身份层：团队→角色→会话，含版本史）          ← 底
 
 ### 3.1 M1a：liveness 轻档与 busy 可见性（list_sessions 增强）
 
-**改动点**：`session_link_pro_list_sessions` 每个会话行增加活性信号行。
+**改动点**：`team_link_list_sessions` 每个会话行增加活性信号行。
 
 **数据来源**（全部已有服务，无新依赖）：
 - agent 服务：ctx.agents.get(id)?.status（running / idle / undefined=未运行）——已有；
@@ -139,7 +139,7 @@ function verdict(s: LivenessSignal, cfg = { silentMin: 10, runMin: 30 }): Verdic
 
 只做一件事：注册的观察者会话空闲、且被盯目标出现失联征兆时，向观察者自身 followup 一条固定文案的 tick。观察者醒来后自己决定轮询/转派/上报。
 
-#### 3.2.2 注册 schema（settings 命名空间 session-link-pro 新增键）
+#### 3.2.2 注册 schema（settings 命名空间 team-link 新增键）
 
 ```yaml
 watchdogs:
@@ -180,11 +180,11 @@ function tickMessage(t, s) {                                   // 正文为插�
     // 引导转告用户；用户授权后模型再 resume。插件绝不直接调 ctx.goals.resume。
     text = "[watchdog] 目标 " + t + " 的 goal 处于 active-but-disarmed（可能原因：max-tokens 回合结束 / "
          + "DSH 重启 / agent error，读数 " + stamp() + "）。该状态不会自愈：请向用户说明并请求授权 resume；"
-         + "用户同意后调用 update_goal(action:"resume") 恢复续跑。复核用 session_link_pro_list_sessions。";
+         + "用户同意后调用 update_goal(action:"resume") 恢复续跑。复核用 team_link_list_sessions。";
   } else {
     text = "[watchdog] 目标 " + t + " 失联征兆：verdict=" + s.verdict
          + " 静默 " + fmt(s.silenceMs) + "（读数 " + stamp() + "）。"
-         + "请用 session_link_pro_list_sessions 复核后处置；误报或不再需要盯人可用 session_link_pro_watch clear。";
+         + "请用 team_link_list_sessions 复核后处置；误报或不再需要盯人可用 team_link_watch clear。";
   }
   return { id: "slp-wd-" + randomUUID(), role: "user",
            source: { kind: "agent-message", form: "relay", senderSessionId: watcherSession },
@@ -196,7 +196,7 @@ function tickMessage(t, s) {                                   // 正文为插�
 
 #### 3.2.4 注册工具与安全
 
-session_link_pro_watch(action: "register"|"list"|"clear", targets?, silentMinutes?, intervalMinutes?, ttlHours?)
+team_link_watch(action: "register"|"list"|"clear", targets?, silentMinutes?, intervalMinutes?, ttlHours?)
 
 - register 仅允许 exec.agent.id === watcherSession（只能给自己注册）；
 - 防失控：单会话并发注册 <=3；silentMinutes >= 10、intervalMinutes >= 5、TTL <= 24h；tick 正文常量化（防 prompt 注入搭车）；
@@ -224,7 +224,7 @@ teams:
 
 #### 3.3.2 工具面
 
-- session_link_pro_roster(action: "get"|"upsert-team"|"set-role"|"retire", team?, role?, session?, note?)
+- team_link_roster(action: "get"|"upsert-team"|"set-role"|"retire", team?, role?, session?, note?)
 - 写权限：policy.writer === "coordinator" 时仅 coordinator.current 会话可写（exec.agent.id 校验）；任何会话可读。settings UI 永远可改（用户是超级写者）。
 - set-role 副作用：若被替换会话存在 pairs，不自动迁移——迁移只发生在 rotation 流程（§3.6），避免绕过换届令牌。
 
@@ -236,12 +236,12 @@ team/<name>/decisions.md    # 裁决账本：只追加，每行 "seq | time | au
 team/<name>/discipline.md   # 纪律条款：整文件替换需带 baseHash（乐观锁）
 ```
 
-- session_link_pro_team_read(team)：一次返回 roster + decisions 末 K=20 条 + discipline 全文（一次读齐，省轮次）；
-- session_link_pro_team_append(team, file, line)：decisions 只追加；discipline 用 baseHash 乐观锁防双写覆盖（P2 场景里两个 worker 并发改稿的实测风险）。
+- team_link_team_read(team)：一次返回 roster + decisions 末 K=20 条 + discipline 全文（一次读齐，省轮次）；
+- team_link_team_append(team, file, line)：decisions 只追加；discipline 用 baseHash 乐观锁防双写覆盖（P2 场景里两个 worker 并发改稿的实测风险）。
 
 ### 3.4 M3：broadcast（角色制 fan-out，无总线）
 
-session_link_pro_send 增加可选参数 targets: string[]，成员为 sessionId 或寻址表达式：
+team_link_send 增加可选参数 targets: string[]，成员为 sessionId 或寻址表达式：
 
 ```ts
 // 解析优先级：sessionId 直达 > "team:<name>/<role>" > "team:<name>/*"（全队）

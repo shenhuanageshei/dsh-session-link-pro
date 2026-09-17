@@ -1,5 +1,5 @@
-# dsh-session-link-pro bundle patch — applied automatically when this
-# package is installed with `dsh plugin --profile <name> add dsh-session-link-pro`
+# dsh-team-link bundle patch — applied automatically when this
+# package is installed with `dsh plugin --profile <name> add dsh-team-link`
 # (the package declares `dsh.bundle.patch` in its package.json).
 #
 # NOTE: only this package's own row is composed. The upstream
@@ -7,5 +7,5 @@
 # shell (loader id 'session-reference'); inserting it again here would create a
 # duplicate loader entry id and crash profile startup.
 - insert:
-    - id: session-link-pro
-      name: 'dsh-session-link-pro'
+    - id: team-link
+      name: 'dsh-team-link'

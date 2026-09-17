@@ -1,5 +1,7 @@
 # 多会话联调实战调研 与 dsh-session-link-pro 升级设计（2026-09-17）
 
+> **更名通告**：本调研完成当日，插件已定名更名 `dsh-team-link`（0.3.0，分支 rename/dsh-team-link）。本文正文保留调研时点的旧名 `dsh-session-link-pro` 与 `session_link_pro_*` 工具名——它们是历史日志与证据链的准确记录，不做回写。实施级设计见 `team-upgrade-design-2026-09-17.md`（v1.2，工具名已更新为 `team_link_*`）。
+
 > **文档用途**：本文档基于一次 16+ 小时真实多会话联调的日志复盘，评估「高配主会话协调 + flash 子会话实施」模式相对传统 agent team 的优劣，并给出 dsh-session-link-pro 的升级设计提案。文档将提交 DSH 会诊（多模型并行评审）做交叉评估——**§7 的开放议题是会诊的重点对象**，§1–§6 是证据与推导，供评审者核验。
 >
 > **插件归属边界（重要）**：本文只涉及 dsh-session-link-pro（跨会话消息 / 会话列表 / 导出 / 深链）。日志中出现的「会诊」（`consult_start` / `consult_stop`，多模型并行评审）是 **dsh-thincoder-suite** 插件的功能，不属于也不应并入本插件。DSH 版本 0.1.5，插件版本 0.2.4。

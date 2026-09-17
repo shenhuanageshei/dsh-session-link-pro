@@ -1,4 +1,4 @@
-// Unit smoke test for the dsh-session-link-pro browser half: loads the client
+// Unit smoke test for the dsh-team-link browser half: loads the client
 // bundle against a stubbed module loader/React and drives the relay-card gate.
 //
 // The gate is the risky part. A DSH 0.1.5 cross-session relay is published as
@@ -53,7 +53,7 @@ const windowStub = {
 
 // The bundle is a plain script that only talks to the loader at load time.
 new Function("window", "document", SOURCE)(windowStub, documentStub);
-check("client bundle registers its module definition", definition !== null && definition.id === "dsh-session-link-pro");
+check("client bundle registers its module definition", definition !== null && definition.id === "dsh-team-link");
 check("client bundle exposes a factory", definition !== null && typeof definition.factory === "function");
 
 const required = [];
@@ -107,13 +107,13 @@ const spanText = (span) => span.children.join("");
 const textOf = (blocks) => [{ type: "text", text: blocks.join("\n\n") }];
 
 const BANNER = "📨 [跨会话消息 · 来自会话 ";
-const FOOTER = "（如需回复，可让本会话调用 session_link_pro_send 工具发回）";
+const FOOTER = "（如需回复，可让本会话调用 team_link_send 工具发回）";
 const relayBody = (sessionId, when, payload) => [BANNER + sessionId + (when === undefined ? "" : ` · ${when}`) + "]", "", payload, "", FOOTER].join("\n");
 
 // 1. pre-0.1.5 history: the retired kind, with its `sentAt` provenance.
 const legacyWhen = "2026-01-02T03:04:05.000Z";
 const legacy = render({
-	source: { kind: "session-link-pro", plugin: "dsh-session-link-pro", fromSession: "session-a", senderSessionId: "session-a", form: "relay", sentAt: legacyWhen },
+	source: { kind: "team-link", plugin: "dsh-team-link", fromSession: "session-a", senderSessionId: "session-a", form: "relay", sentAt: legacyWhen },
 	content: textOf([relayBody("session-a", undefined, "老日志正文")]),
 }, "slp-11111111-1111-1111-1111-111111111111");
 check("legacy kind still renders as a card", isCard(legacy));
@@ -221,13 +221,13 @@ check("short id still passes through unchanged", spanText(headSpan(shortIdCard, 
 // already carry a lone surrogate. The DOM would repair it via USVString
 // conversion; this harness has no DOM, so the repair is asserted where it is
 // visible — the rendered body text itself.
-const poisonedLegacy = render({ source: { kind: "session-link-pro", fromSession: "session-p", sentAt: legacyWhen }, content: textOf([relayBody("session-p", undefined, "断开的\uD83D 负载")]) }, "slp-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+const poisonedLegacy = render({ source: { kind: "team-link", fromSession: "session-p", sentAt: legacyWhen }, content: textOf([relayBody("session-p", undefined, "断开的\uD83D 负载")]) }, "slp-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
 check("a lone surrogate in a legacy row body is repaired", !LONE.test(bodyTextOf(poisonedLegacy)));
 check("the repaired legacy body keeps its text", bodyTextOf(poisonedLegacy).includes("断开的") && bodyTextOf(poisonedLegacy).includes("负载"));
 // A SHORT (unshortened, <= 26 code units) id is returned verbatim by the
 // shortener, so the repair has to sit on the rendered value, not only on the cut.
 const rawHalfId = "session-\uD83Dq";
-const poisonedRawId = render({ source: { kind: "session-link-pro", fromSession: rawHalfId, sentAt: legacyWhen }, content: textOf([relayBody(rawHalfId, undefined, "短 id 带半截")]) }, "slp-cccccccc-cccc-cccc-cccc-cccccccccccc");
+const poisonedRawId = render({ source: { kind: "team-link", fromSession: rawHalfId, sentAt: legacyWhen }, content: textOf([relayBody(rawHalfId, undefined, "短 id 带半截")]) }, "slp-cccccccc-cccc-cccc-cccc-cccccccccccc");
 check("a short poisoned sender id is repaired", rawHalfId.length <= 26 && !LONE.test(spanText(headSpan(poisonedRawId, "dshsl-relay-sender"))));
 // The delegation fallback renders OTHER plugins' context text — still this file's
 // output, so it goes through the same repair.

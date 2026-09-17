@@ -1,4 +1,4 @@
-// Unit smoke test for the dsh-session-link-pro host half: drives the
+// Unit smoke test for the dsh-team-link host half: drives the
 // registered agent/pre-step listener through a real cordis waterfall with a
 // stubbed sessionReferenceResolver (upstream deep-link behavior, unchanged),
 // then exercises the three -pro tools against stubbed services.
@@ -199,14 +199,14 @@ check("dsh:// in markdown destination injected", decision9.messages.length === 2
 // -pro: registration surface
 // ---------------------------------------------------------------------------
 
-check("three tools registered", ["session_link_pro_list_sessions", "session_link_pro_export", "session_link_pro_send"].every((name) => env.tool(name) !== undefined));
-check("export route registered", env.routes.length === 1 && env.routes[0].kind === "exact" && env.routes[0].path === "/session-link-pro/export");
+check("three tools registered", ["team_link_list_sessions", "team_link_export", "team_link_send"].every((name) => env.tool(name) !== undefined));
+check("export route registered", env.routes.length === 1 && env.routes[0].kind === "exact" && env.routes[0].path === "/team-link/export");
 
 // ---------------------------------------------------------------------------
 // -pro: list tool
 // ---------------------------------------------------------------------------
 
-const listTool = env.tool("session_link_pro_list_sessions");
+const listTool = env.tool("team_link_list_sessions");
 const listOut = await listTool.execute({}, execFor(env.senderAgent));
 check("list shows same-project sessions", listOut.includes("session-target") && listOut.includes("session-runner") && listOut.includes("session-cold"));
 check("list hides other-project sessions by default", !listOut.includes("session-other"));
@@ -231,7 +231,7 @@ const exportEvents = [
 const exportEnv = setup({ sessions, eventsBySession: { "session-target": exportEvents } });
 const tmpDir = path.resolve(".test-tmp");
 rmSync(tmpDir, { recursive: true, force: true });
-const exportTool = exportEnv.tool("session_link_pro_export");
+const exportTool = exportEnv.tool("team_link_export");
 const exportOut = await exportTool.execute({ sessionId: "session-target", outputDir: tmpDir }, execFor(exportEnv.senderAgent));
 check("export reports two files", exportOut.includes("已导出会话") && exportOut.includes(".md") && exportOut.includes(".json"));
 const mdPath = exportOut.split("\n").map((line) => line.replace("- ", "").trim()).find((line) => line.endsWith(".md"));
@@ -244,7 +244,7 @@ check("markdown renders tool result", md.includes("结果文本") && md.includes
 check("markdown has header block", md.includes("# 会话导出") && md.includes("session-target"));
 const json = jsonPath !== undefined ? JSON.parse(await readFile(jsonPath, "utf8")) : {};
 check("json keeps full event log", json.eventCount === 4 && Array.isArray(json.events) && json.events.length === 4);
-check("json marks exporter", json.exporter === "dsh-session-link-pro");
+check("json marks exporter", json.exporter === "dsh-team-link");
 const exportMissing = await exportTool.execute({ sessionId: "session-nope", outputDir: tmpDir }, execFor(exportEnv.senderAgent));
 check("export of unknown session reports failure", exportMissing.includes("导出失败"));
 
@@ -253,7 +253,7 @@ check("export of unknown session reports failure", exportMissing.includes("导�
 // ---------------------------------------------------------------------------
 
 const sendEnv = setup({ sessions, askScript: ["发送", "接收"] });
-const sendTool = sendEnv.tool("session_link_pro_send");
+const sendTool = sendEnv.tool("team_link_send");
 const sendOut = await sendTool.execute({ targetSessionId: "session-target", message: "联调提醒：接口地址已切换" }, execFor(sendEnv.senderAgent));
 check("send reports wake delivery", sendOut.includes("已投递") && sendOut.includes("唤醒"));
 check("idle target received followup() once", sendEnv.targetCalls.followedup.length === 1 && sendEnv.targetCalls.injected.length === 0 && sendEnv.targetCalls.steered.length === 0);
@@ -276,7 +276,7 @@ check("receiver confirmation asked on target agent", sendEnv.uq.requests[1].ques
 // ---------------------------------------------------------------------------
 
 const steerEnv = setup({ sessions, askScript: ["发送", "接收"], targetStatus: "running" });
-const steerOut = await steerEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-target", message: "快停，发现冲突" }, execFor(steerEnv.senderAgent));
+const steerOut = await steerEnv.tool("team_link_send").execute({ targetSessionId: "session-target", message: "快停，发现冲突" }, execFor(steerEnv.senderAgent));
 check("running target reports current-turn injection", steerOut.includes("已投递") && steerOut.includes("当前回合"));
 check("running target received steer() once", steerEnv.targetCalls.steered.length === 1 && steerEnv.targetCalls.injected.length === 0 && steerEnv.targetCalls.followedup.length === 0);
 
@@ -285,7 +285,7 @@ check("running target received steer() once", steerEnv.targetCalls.steered.lengt
 // ---------------------------------------------------------------------------
 
 const pairEnv = setup({ sessions, askScript: ["发送", "配对：双向免确认"] });
-const pairTool = pairEnv.tool("session_link_pro_send");
+const pairTool = pairEnv.tool("team_link_send");
 const pairOut1 = await pairTool.execute({ targetSessionId: "session-target", message: "建对第一条" }, execFor(pairEnv.senderAgent));
 check("pairing send delivers", pairOut1.includes("已投递") && pairEnv.targetCalls.followedup.length === 1);
 check("pair option offered on receiver confirm", pairEnv.uq.requests[1].questions[0].options.some((option) => option.label.startsWith("配对")));
@@ -299,10 +299,10 @@ check("pairing auto-relays in reverse direction", revOut.includes("已配对") &
 // ---------------------------------------------------------------------------
 
 const rejectEnv = setup({ sessions, askScript: ["发送", "拒绝并屏蔽该会话", "发送"] });
-const rejectOut = await rejectEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-target", message: "第一条" }, execFor(rejectEnv.senderAgent));
+const rejectOut = await rejectEnv.tool("team_link_send").execute({ targetSessionId: "session-target", message: "第一条" }, execFor(rejectEnv.senderAgent));
 check("rejection reports block", rejectOut.includes("拒绝并屏蔽"));
 check("rejected message not delivered", rejectEnv.targetCalls.injected.length === 0 && rejectEnv.targetCalls.followedup.length === 0);
-const blockedOut = await rejectEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-target", message: "第二条" }, execFor(rejectEnv.senderAgent));
+const blockedOut = await rejectEnv.tool("team_link_send").execute({ targetSessionId: "session-target", message: "第二条" }, execFor(rejectEnv.senderAgent));
 check("follow-up blocked without receiver ask", blockedOut.includes("已屏蔽") && rejectEnv.uq.requests.length === 2);
 
 // ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ check("follow-up blocked without receiver ask", blockedOut.includes("已屏蔽")
 // ---------------------------------------------------------------------------
 
 const cancelEnv = setup({ sessions, askScript: ["取消"] });
-const cancelOut = await cancelEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-target", message: "算了" }, execFor(cancelEnv.senderAgent));
+const cancelOut = await cancelEnv.tool("team_link_send").execute({ targetSessionId: "session-target", message: "算了" }, execFor(cancelEnv.senderAgent));
 check("cancel reports refusal", cancelOut.includes("已取消"));
 check("canceled message not delivered", cancelEnv.targetCalls.injected.length === 0 && cancelEnv.targetCalls.followedup.length === 0 && cancelEnv.uq.requests.length === 1);
 
@@ -319,9 +319,9 @@ check("canceled message not delivered", cancelEnv.targetCalls.injected.length ==
 // ---------------------------------------------------------------------------
 
 const guardEnv = setup({ sessions, askScript: [] });
-const selfOut = await guardEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-self", message: "自发自收" }, execFor(guardEnv.senderAgent));
+const selfOut = await guardEnv.tool("team_link_send").execute({ targetSessionId: "session-self", message: "自发自收" }, execFor(guardEnv.senderAgent));
 check("self-send refused", selfOut.includes("不能是当前会话"));
-const deadOut = await guardEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-cold", message: "喂" }, execFor(guardEnv.senderAgent));
+const deadOut = await guardEnv.tool("team_link_send").execute({ targetSessionId: "session-cold", message: "喂" }, execFor(guardEnv.senderAgent));
 check("dead target refused", deadOut.includes("没有活动代理"));
 
 // ---------------------------------------------------------------------------
@@ -351,7 +351,7 @@ const loneEnv = setup({
 	sessions: [{ header: { id: "session-emoji", createdAt: 5000, cwd: CWD }, live: false, persisted: true }],
 	eventsBySession: { "session-emoji": loneTopicEvents },
 });
-const loneListTool = loneEnv.tool("session_link_pro_list_sessions");
+const loneListTool = loneEnv.tool("team_link_list_sessions");
 const setLoneTopic = (text) => { loneTopicEvents[0].data.content[0].text = text; };
 /** Run the list tool on one topic and return the whole output plus its 主题段. */
 const listForTopic = async (topic) => {
@@ -393,7 +393,7 @@ const truncEnv = setup({
 });
 const truncDir = path.resolve(".test-tmp-lone");
 rmSync(truncDir, { recursive: true, force: true });
-const truncOut = await truncEnv.tool("session_link_pro_export").execute({ sessionId: "session-long", outputDir: truncDir }, execFor(truncEnv.senderAgent));
+const truncOut = await truncEnv.tool("team_link_export").execute({ sessionId: "session-long", outputDir: truncDir }, execFor(truncEnv.senderAgent));
 const truncMdPath = truncOut.split("\n").map((line) => line.replace("- ", "").trim()).find((line) => line.endsWith(".md"));
 const truncMd = truncMdPath === undefined ? "" : await readFile(truncMdPath, "utf8");
 check("export md artifact written for the oversized text", truncMdPath !== undefined);
@@ -407,7 +407,7 @@ rmSync(truncDir, { recursive: true, force: true });
 //     must not be written into the TARGET session's log by the relay banner.
 const poisonText = `${"y".repeat(5)}\uD83D 断开的负载`;
 const poisonEnv = setup({ sessions, askScript: ["发送", "接收"] });
-await poisonEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-target", message: poisonText }, execFor(poisonEnv.senderAgent));
+await poisonEnv.tool("team_link_send").execute({ targetSessionId: "session-target", message: poisonText }, execFor(poisonEnv.senderAgent));
 check("sender confirm dialog has no lone surrogate", poisonEnv.uq.requests[0] !== undefined && !hasLone(poisonEnv.uq.requests[0].questions[0].question));
 check("receiver confirm dialog has no lone surrogate", poisonEnv.uq.requests[1] !== undefined && !hasLone(poisonEnv.uq.requests[1].questions[0].question));
 const poisonDelivered = poisonEnv.targetCalls.followedup[0];
@@ -428,7 +428,7 @@ check("injected snapshot keeps its text", linkDecision.messages.length === 2 && 
 //     targetSessionId must not have that half-emoji echoed into its own history
 //     by the refusal text.
 const echoEnv = setup({ sessions, askScript: [] });
-const echoOut = await echoEnv.tool("session_link_pro_send").execute({ targetSessionId: "session-nope\uD83D", message: "x" }, execFor(echoEnv.senderAgent));
+const echoOut = await echoEnv.tool("team_link_send").execute({ targetSessionId: "session-nope\uD83D", message: "x" }, execFor(echoEnv.senderAgent));
 check("a refusal echoing a poisoned target id is repaired", !hasLone(echoOut));
 check("a refusal still names the target id it was given", echoOut.includes("session-nope"));
 

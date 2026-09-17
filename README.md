@@ -18,6 +18,7 @@
 | 🐕 跨会话看门狗 | 给自己注册盯人：被盯会话出现失联征兆且你空闲时，插件向你自己的会话投递一条固定文案的 tick | `team_link_watch` |
 | 🎭 团队 roster | 团队 → 角色 → 会话的身份注册表，含**版本史**（退役≠删除）与写入策略（默认只有现任协调者会话可写）；`<workspace>/team/<name>/roster.md` 是人可读镜像 | `team_link_roster` |
 | 📋 团队黑板 | `<workspace>/team/<name>/` 下的 `decisions.md`（只追加的裁决账本，seq 由插件分配）与 `discipline.md`（整文件替换，baseHash 乐观锁）；任何会话可读可写，写入者记在行内 author | `team_link_team_read` / `team_link_team_append` |
+| 🔄 团队换届 | 两阶段交接：现任 `prepare` 出**一次性令牌**（绑定 team+role+successor，30 分钟）并广播冻结；继任者凭令牌 `claim`——单个对话框逐项勾选要迁移的免确认通道，域限定迁移 + 退役者信任对称吊销；无人值守则 provisional + 24h 自动回退 | `team_link_rotate` |
 
 ## 跨会话消息语义
 
@@ -204,6 +205,103 @@ teams:
 - 没有会话身份（`exec.agent.id` 缺失）的写入仍被接受（黑板无门），author 记 `unknown`——不编造身份。
 - `decisions` 写入是**读-算 seq-追加**（`appendFile`，不重写正文）：并发追加最坏只是两条同 seq，不会丢行——§3.3.3 只要求 `discipline` 带乐观锁。
 
+## 团队换届 rotation（M4）
+
+团队换人不是「改个 current」：新任会自动继承一条**绕过两道批准门**的免确认通道（`pairs`，连接收方的显式 reject 策略都覆盖），所以交接被拆成两个阶段 + 一次性令牌 + 域限定迁移 + 可回退的临时信任。
+
+```mermaid
+sequenceDiagram
+  participant R as 现任（旧任）
+  participant P as 插件
+  participant S as 继任者
+  participant W as 团队其他成员
+  participant U as 用户
+  R->>P: team_link_rotate action=prepare（successor）
+  P->>W: [rotation-freeze] 固定冻结清单
+  P-->>R: 令牌 T（30 分钟有效，明文只此一次）
+  R->>S: 交接 prompt（含 T，内容由模型起草）
+  S->>P: team_link_rotate action=claim（token=T）
+  P->>U: 单个对话框：逐项勾选要迁移的 pairs
+  alt 在场并提交
+    P->>W: pairs 域内迁移（正式）+ [rotation-done 已批准]
+  else 无人值守 / 超时 / 无确认服务
+    P->>W: pairs 域内迁移（provisional, 24h）+ [rotation-done 待批准(24h)]
+    U-->>P: 24h 内在设置里把该 pair 的 provisional 置 false → 转正式
+    P->>W: 24h 未批准 → 删除 pairs + [rotation-expired]
+  end
+  P->>W: 30 分钟无人认领 → [rotation-cancelled]（旧任仍为 current，解除冻结）
+```
+
+### prepare（Phase A，只能由该角色的现任会话发起）
+
+- **前置**：`exec.agent.id === roles[role].current`；用户路径是设置 UI（直接改 `teams` 键），不是工具调用；
+- **速率限制**：同一 team+role 在 **10 分钟**内已有 pending 或刚完成过一次换届 → 拒绝（防换届风暴）；
+- **令牌**：`randomUUID()`，绑定三元组 `(team, role, successor)`，**30 分钟**有效、成功认领即作废；
+- **快照**：把 prepare 时刻的 `pairs` / `trustedSenders` / `rememberTargets` / roster 全量写进 `rotationBackup`（对称撤销的还原依据）；
+- **广播**：向团队全部在任成员投递 `[rotation-freeze]` 冻结清单（停哨兵/后台 job → 确认无在飞动作 → 状态冻结回报 → 等待交接结果通知）；
+- **返回**：令牌明文（**唯一一次**）+ 掩码形式 + 交接指引（30 分钟有效、「交接内容由模型起草，机制与判断分离」、上任首动作建议 `/goal resume` 或建新 goal、错峰默认、§3.6.4 的「先开会话再 prepare」兜底）。
+
+### claim（Phase B，只能由 pending 指定的继任者会话凭令牌发起）
+
+- **前置**：`exec.agent.id === pending.session`（且 pending 未过期）；令牌**精确匹配**且绑定三元组一致；
+- **一个对话框**（`userQuestions.ask`，`multiSelect`）：把全部「退役者↔同 team 成员」的候选 pairs 列成一个多选问题——勾选 = 迁移，不勾选 = 随退役清理（今后该对端走正常首问门）。对端在团队外的 pairs **不进候选**，但会在对话框的 `detail` 里被点名（透明）；
+- **在场确认 = ratified**：超时（3 分钟）/ 无确认服务 / 对话框失败 = **无人值守路径**：全部域内候选以 `provisional` 迁移，并开一个 **24h 回退窗口**；
+- **迁移与撤销**（原则 2/3）：
+  - 迁移 = `replaceWith(新任, 对端)`：删除退役者的旧 pair，新建 `{a: 新任, b: 对端, provisional, expiresAt}`；
+  - 对称撤销 = 退役者**持有**的 pairs（全部）、`trustedSenders` 中指向退役者的项、`rememberTargets` 中指向退役者的项，一并清除——退役会话可能还活着，不吊销就是永久保送；
+- **落盘顺序**：迁移 + 落定（`current`/版本史/`migratedPairs` 标记）在**同一笔写入**里完成，随后才清除 `pending`——因此「pending 还在且 `migratedPairs` 非空」只可能意味着上次 claim 没收尾；
+- **幂等**：同一令牌重放 → 返回既有迁移清单、**不重复迁移**、不重复改信任数据，只补做收尾（并重发一次 `rotation-done`，避免 worker 因崩溃卡在冻结里）；成功之后令牌作废，再 claim 是「没有 pending」；
+- **广播** `[rotation-done]`：`已批准` 或 `待批准(24h)`。
+
+### 未批准路径与到期清扫（评审 #4 / #5）
+
+| 对象 | 期限 | 到点行为 |
+| --- | --- | --- |
+| `pending`（令牌） | 30 分钟 | 清除 pending + 广播 `[rotation-cancelled]`：**旧任仍为 current**、令牌过期未认领、解除冻结 |
+| `provisional` pairs | 24 小时 | 删除迁移出的 pairs + 版本史追加 `provisional 未批准过期` + 广播 `[rotation-expired]`：**新任保持 current**（换届事实已成立，降格要用户显式操作），信任回退为正常过门 |
+
+清扫挂在 **M1 看门狗的同一个巡逻定时器**上（另有「每次 roster 触碰 / 换届调用时惰性检查」兜底，所以即使一个看门狗都没注册也不会漏）。
+**补批准**的入口是设置 UI：24h 内把该 pair 的 `provisional` 置为 `false`（或删掉 `expiresAt`）即转正式；已回退后不再复得。
+
+### 内部通知与实现裁量点
+
+四种通知（`rotation-freeze` / `rotation-done` / `rotation-cancelled` / `rotation-expired`）的**正文是插件常量**：只有团队名、角色名、会话 id、读数时间、状态词被插值，且每个插值都先过单行清洗——模型的 `note`、消息正文一律进不去通知正文（与看门狗 tick 同一条红线）。投递走**内部广播路径**：
+
+- **免发送方审批**（正文是插件常量，不是模型可注入的载荷），但**接收方的 inbound 策略与 `blockedSenders` 照旧生效**（显式屏蔽永远优先）；
+- **发送方身份**：`prepare` / `claim` 用发起该动作的会话；清扫类通知用「该角色现任」——取消时是**旧任**（通知正是关于它「仍为 current」），回退时是**继任者**；现任空缺且无继任者时通知不发并如实报告，绝不编造发送方；
+- **清扫类通知不弹确认框**：后台清扫没有在场用户，接收方策略为 `ask` 时该目标记一行「不弹确认框」并跳过（弹框会把巡逻阻塞 3 分钟）；把发送方加入 `trustedSenders` 或建立配对方可收到；
+- **provisional 可见面**（不下放给 `source`，也不加 `meta` 字段）：`send` 经 provisional 通道投递的返回文案后缀「（provisional 通道，24h 内未批准自动回退）」、`rotation-done` 的状态词、`team_link_roster action=get` 的 `pending` / `provisional` 行、`team_link_list_sessions` 会话行上的「provisional 配对 N 条」标记。
+
+### 换届记账的结构（`teams` 键内）
+
+```yaml
+roles:
+  - role: coordinator
+    current: session-new        # 换届后 = 新任
+    pending:                    # 仅在 prepare 与 claim 之间非空
+      session: session-new      # 继任者；只有该会话能 claim
+      token: 1a2b3c4d-...       # 一次性令牌（一切渲染都是掩码 tok-1a2b…9f0e）
+      team: night-shift
+      role: coordinator
+      createdAt: 1700000000000
+      expiresAt: 1700001800000  # = createdAt + 30min
+      migratedPairs: []         # 幂等标记：非空 = 上次 claim 已迁移（重放只收尾）
+      note: 交班                 # 可选：随 pending 带到 claim 的版本史备注
+    rotationAt: 1700000000000   # 最近一次「完成」的换届（速率限制的另一半）
+    provisional:                # 未批准的 24h 回退窗口；ratified / 已回退时为 null
+      at: 1700000000000
+      expiresAt: 1700086400000
+      session: session-new
+rotationBackup:                 # prepare 时全量快照（撤销依据，永不自动清理）
+  at: 1700000000000
+  pairs: [...]                  # prepare 时刻的全部 pairs（副本）
+  trustedSenders: [...]
+  rememberTargets: [...]
+  roster: {...}                 # prepare 时刻的团队记录快照（含旧任）
+```
+
+**错峰默认**（§3.6.1）：先换协调者 → 稳定 → 再换 worker，任何时刻保留一个活记忆；一次全换之前必须先跑 FREEZE 清单并把交接文档落盘。
+
 ## 策略配置
 
 设置命名空间 `team-link`（设置 UI 可直接编辑；settings 服务不可用时降级为进程内记忆）：
@@ -214,9 +312,9 @@ teams:
 | `trustedSenders` | `string[]` | 免确认接收的发送方会话 |
 | `blockedSenders` | `string[]` | 拒收并屏蔽（优先级最高） |
 | `rememberTargets` | `string[]` | 发送方免确认的目标会话 |
-| `pairs` | `{a, b, createdAt}[]` | 双向免确认配对通道 |
+| `pairs` | `{a, b, createdAt, provisional, expiresAt}[]` | 双向免确认配对通道。`provisional: true` = 由换届（M4）在无人值守路径上临时授予的通道，`expiresAt`（毫秒时间戳）到期未获批准即自动删除并回退为正常过门；正常配对的 `provisional` 为 `false`、`expiresAt` 为 `0` |
 | `watchdogs` | `{id, team, watcherSession, targets, silentMinutes, intervalMinutes, expiresAt, createdAt}[]` | 跨会话看门狗注册（由 `team_link_watch` 读写；到点自动清理。手改设置时缺字段的条目会被丢弃，不会让整个命名空间失效） |
-| `teams` | `{name, createdAt, workspace, policy:{writer}, roles:[{role, current, pending, history}]}[]` | 团队 roster（M2，由 `team_link_roster` 读写；`policy` 只能由用户在此处改）。`name` 必须是 `[a-z0-9-]+`（它是黑板目录的路径段），`workspace` 是团队首次创建时捕获的会话工作目录、也是黑板 `team/<name>/` 的根；手改设置时非法团队名/无名角色会被丢弃 |
+| `teams` | `{name, createdAt, workspace, policy:{writer}, roles:[{role, current, pending, rotationAt, provisional, history}], rotationBackup}[]` | 团队 roster（M2 建立，M4 扩展换届记账；由 `team_link_roster` / `team_link_rotate` 读写；`policy` 只能由用户在此处改）。`name` 必须是 `[a-z0-9-]+`（它是黑板目录的路径段），`workspace` 是团队首次创建时捕获的会话工作目录、也是黑板 `team/<name>/` 的根；手改设置时非法团队名/无名角色会被丢弃 |
 
 ## 安装
 
@@ -263,15 +361,16 @@ dev_install_package { dir: "<你的目录>/dsh-team-link", profile: "web" }
 ## 测试
 
 ```
-npm test                  # host 311 项 + client 42 项（合计 353 项）
-node host-half.test.mjs   # 上游深链 9 例 + 工具注册/列表/导出/发送/配对全流程（含拒绝/取消/自发送/死目标守卫）+ 活性信号（verdict 五态判定表与两个阈值边界、goals 服务缺失降级、列表活性行与读数时效戳）+ 看门狗（注册校验全表、四态巡逻策略、tick source 三成员合规与正文常量化、去抖、TTL 自清、观察者 dead 分支、dispose 清理定时器）+ roster 与黑板（写权限三态与现任比对、upsert-team 幂等与 workspace 捕获、set-role 的版本史与「不迁移 pairs」、retire 的置空/版本史/两条清理对话框分支/无确认服务降级、镜像一致性与镜像失败降级、团队名与 file 白名单、decisions seq 与行格式与 500 字符上限、discipline baseHash 乐观锁的冲突与成功两路、末 20 条窗口）+ M3 广播（寻址解析与通配仅协调者、逐目标独立过门与无确认服务的 fail-closed、≤8 上限与整次拒绝、重复目标去重、no-holder 与团队不存在、单目标/广播互斥）+ 信封 banner（枚举校验全表、ref 按码点截断并注明、首行格式与部分键、source 仍三成员、fan-out 共享 meta）+ busy 预判（运行中分钟数 / 时间戳不可读回退 / 空闲原文案 / fan-out 逐目标）+ M2 评审跟进（R1 retire 清理竞态、R3 applyRetire 两条错误分支、R4 baseHash 语义断言）+ 孤立代理项安全（121 个偏移的属性测试、生产边界、预污染源、导出切点、提问与 banner）
-node client-half.test.mjs # 浏览器端：卡片判定（旧 kind / 新形状 / 上游同形消息不得误判 / node.id 与 banner 双信号）+ 头部按钮 + 孤立代理项安全（astral id 截断、旧日志正文修复）
+npm test                  # host 385 项 + client 46 项（合计 431 项）
+node host-half.test.mjs   # 上游深链 9 例 + 工具注册/列表/导出/发送/配对全流程（含拒绝/取消/自发送/死目标守卫）+ 活性信号（verdict 五态判定表与两个阈值边界、goals 服务缺失降级、列表活性行与读数时效戳）+ 看门狗（注册校验全表、四态巡逻策略、tick source 三成员合规与正文常量化、去抖、TTL 自清、观察者 dead 分支、dispose 清理定时器）+ roster 与黑板（写权限三态与现任比对、upsert-team 幂等与 workspace 捕获、set-role 的版本史与「不迁移 pairs」、retire 的置空/版本史/两条清理对话框分支/无确认服务降级、镜像一致性与镜像失败降级、团队名与 file 白名单、decisions seq 与行格式与 500 字符上限、discipline baseHash 乐观锁的冲突与成功两路、末 20 条窗口）+ M3 广播（寻址解析与通配仅协调者、逐目标独立过门与无确认服务的 fail-closed、≤8 上限与整次拒绝、重复目标去重、no-holder 与团队不存在、单目标/广播互斥）+ 信封 banner（枚举校验全表、ref 按码点截断并注明、首行格式与部分键、source 仍三成员、fan-out 共享 meta）+ busy 预判（运行中分钟数 / 时间戳不可读回退 / 空闲原文案 / fan-out 逐目标）+ M2 评审跟进（R1 retire 清理竞态、R3 applyRetire 两条错误分支、R4 baseHash 语义断言）+ 团队换届 M4（prepare 的令牌绑定/30 分钟 TTL/rotationBackup 快照/速率限制两条分支/掩码只此一次明文、FREEZE 常量清单与投递、claim 的单个多选对话框逐项勾选、域限定迁移、对称撤销、roster 落定与版本史、令牌掩码在镜像与 roster get 的落实、错令牌/跨 team-role 绑定/非继任者/过期令牌四种拒绝、过期清扫与 rotation-cancelled、无人值守 provisional 迁移与 24h 回退窗口、provisional send 后缀与 list_sessions 标记、fake now 驱动的 TTL 回退（pairs 删除 + history 记录 + 新任保持 current + rotation-expired）、claim 幂等重放与「已另行变更」重放、内部广播的 blockedSenders 拦截与清扫不弹框、四条通知常量文案与单行清洗、goals.resume 零调用红线）+ M3 评审顺带修复（R5 fan-out 逐目标异常隔离、R6 寻址保留字 * 拒收）+ 孤立代理项安全（121 个偏移的属性测试、生产边界、预污染源、导出切点、提问与 banner）
+node client-half.test.mjs # 浏览器端：卡片判定（旧 kind / 新形状 / 上游同形消息不得误判 / node.id 与 banner 双信号）+ banner 时间兜底（含 R7：带信封 meta 的首行仍能解析出时间，且日期样标题不得抢先）+ 头部按钮 + 孤立代理项安全（astral id 截断、旧日志正文修复）
 ```
 
 `host-half.test.mjs` 里那组 `AUDITED_SOURCE_KINDS` 断言是**迁移契约的回归锁**：它按 `@deepseek-ai/dsh-session-format-v2-to-v3` 的白名单与「恰好三成员」规则检查投递出去的 `source`，改坏了会立刻红。`client-half.test.mjs` 则锁定「上游相邻代理消息不得被误判成本插件卡片」这条容易复发的边界。两边新增的孤立代理项断言是**字符串安全的回归锁**：host 侧把 emoji 走遍 0..120 每一个切割偏移（其中恰好一个偏移在生产代码上留下半截 emoji），另加生产边界、预污染源、导出切点、两处批准提问、投递 banner、深链快照注入、poisoned targetId 回显与「快照缺失不得塞进 undefined」（最后一项同时锁 resolver 契约里 `additionalContext` 可选这条）；client 侧覆盖 astral id 的两个半截方向、旧日志正文、未截断的短 id 与委托回退文本。
 
 ## Changelog
 
+- **0.3.4（M4，未发布；`package.json` 的版本号随发布统一 bump）** — 两阶段换届 rotation（设计 `docs/team-upgrade-design-2026-09-17.md` §3.6 全节（含 §3.6.1 边界四原则、§3.6.2 伪代码含评审 #3/#4/#5 补丁）+ §4.1 换届行 + §5.1 U6 + §5.3 红线）：新增 `team_link_rotate`（`action: prepare | claim`）。`prepare`（Phase A，仅该角色现任会话，用户路径是设置 UI）：10 分钟速率限制防换届风暴；生成一次性令牌（`randomUUID()`，绑定 `(team, role, successor)` 三元组，30 分钟 TTL，成功认领即作废）；把 `pairs`/`trustedSenders`/`rememberTargets`/roster 全量快照进 `rotationBackup`（撤销依据）；向团队全部在任成员广播 `[rotation-freeze]` 固定冻结清单（停哨兵/后台 job → 确认无在飞动作 → 状态冻结回报 → 等待交接结果通知）；返回一次性明文令牌 + 掩码形式 + 交接指引（模型起草交接内容、上任首动作建议 `/goal resume` 或建新 goal、错峰默认、§3.6.4 半自动兜底）。`claim`（Phase B，仅 pending 指定的继任者会话凭令牌）：单个 `userQuestions` 多选对话框列出全部「退役者↔同 team 成员」候选 pairs 逐项勾选（对端在团队外的 pair 不进候选但在 detail 里点名）；在场确认 = ratified → 正式迁移；超时/无确认服务/失败 = 无人值守 → 全部域内候选以 provisional 迁移并开 24h 回退窗口；迁移 = 删除退役者旧 pair + 新建 `{a: 新任, b: 对端, provisional, expiresAt}`；对称撤销 = 退役者持有的全部 pairs + trustedSenders + rememberTargets 同步清除；落定（current=新任、版本史旧任 until=now+note、新任 until=null、`rotationAt`）与迁移在**同一笔写入**（含 `migratedPairs` 幂等标记），随后才清 pending —— 崩溃在两者之间时同一令牌重放只补收尾、不重复迁移，并重发 `rotation-done` 释放冻结；成功后令牌作废。到期清扫（**挂 M1 看门狗同一巡逻定时器 + 每次 roster 触碰/换届调用惰性检查**）：30 分钟未认领 → 清 pending + `[rotation-cancelled]`（旧任仍为 current、解除冻结）；24h 未批准 → 删 provisional pairs + 版本史记 `provisional 未批准过期` + `[rotation-expired]`（新任保持 current、信任回退为过门投递）。**内部广播路径**：四种通知正文是插件常量（只插值团队/角色/会话 id/读数/状态词，且先过单行清洗，模型 `note` 与消息正文进不去），免发送方审批但**照走接收方 inbound 策略与 `blockedSenders`**；清扫类通知不弹确认框（接收方策略 ask 时记一行跳过）。**令牌掩码**（M2 评审 #3 落实）：`roster.md` 镜像与 `team_link_roster action=get` 的 pending 一律渲染 `tok-<前4>…<后4>`，明文只在 prepare 的一次性返回里出现。**provisional 可见面**（§3.6.2 评审 #3）：send 经 provisional 通道投递的返回文案后缀「（provisional 通道，24h 内未批准自动回退）」、`rotation-done` 状态词（已批准 / 待批准(24h)）、roster get 的 pending/provisional 行、`team_link_list_sessions` 会话行的「provisional 配对 N 条」标记；banner 与 `source`（仍恰好三成员）都不加字段。**补批准入口 = 设置 UI**（24h 内把该 pair 的 `provisional` 置 false 即转正式；设计未给工具面补批准 action，属实现裁量，见交付报告）。设置命名空间新增字段：`roles[].rotationAt` / `roles[].provisional` / `teams[].rotationBackup` / `pending.{createdAt, note, migratedPairs}` / `pairs[].{provisional, expiresAt}`（schema 显式声明，否则 settings 往返会把 provisional 抹掉）。顺带 3 项 M3 评审修复：**R5** fan-out 逐目标包 try/catch——第 N 个目标抛异常（steer/followup 抛错、服务中途消失）落成该目标自己的 refused 行，其余目标照投、汇总行永远产出；**R6** `readRoleName` 拒收保留字 `*`（寻址文法 `team:<name>/*` 的保留字，以 * 命名的角色永远无法被点对点寻址）；**R7** 客户端卡片时间兜底正则放宽，允许时间戳后跟 §3.4 信封字段（`… 23:42:05 · type=ruling pri=P0 ref=…]`）仍解析出时间，同时保留「日期样标题不得抢先」的锚定。红线全部保留：source 恰三成员、所有模型可见输出过 wellFormed、内部通知正文 = 插件常量、**永不调用 goals.resume**（继任者只被建议）。`host-half.test.mjs` 净增 **74** 项断言（311 → 385，当次实测）、`client-half.test.mjs` 净增 **4** 项（42 → 46，当次实测），既有 311 + 42 项不回归（合计 431）。
 - **0.3.3（M3，未发布；`package.json` 的版本号随发布统一 bump）** — 广播 fan-out + 结构化信封 banner + busy 预判（设计 `docs/team-upgrade-design-2026-09-17.md` §3.4 + §3.5 + §4.1 信封行 + §5.1 U5/U7）：`team_link_send` 新增可选 `targets: string[]`（与 `targetSessionId` 互斥；两者都给或都不给都是明确参数错误，单目标语义不变），按 §3.4 优先级解析「会话 id 直达 > `team:<name>/<role>` > `team:<name>/*`」；`team:<name>/*` 全队广播仅该团队**现任协调者会话**可发（否则整次调用拒绝，拒绝文案引用《调研》§5.3 论据 (a) 的策展理由），全队展开 = 该团队全部在任且存活的角色（不含发起者自身）；角色当前空缺或不存在 → 类型化 `no-holder` 结果（不算投递也不算失败），团队不在 roster 或表达式形状非法 → 整次调用拒绝（不做「半发」）；fan-out **不放宽任何门**——逐目标照走屏蔽检查/配对快路径/发送方确认/接收方策略，确认服务不可用时逐目标 fail-closed，N 个未配对目标就是 N 次批准；单次 ≤**8** 目标，逐目标返回 `delivered | refused | no-agent | no-holder` 结果行，末行 `汇总：N 投递 / M 拒绝[ / A 无活动代理][ / K 空缺目标][ / D 个重复目标已去重]`，重复会话 id 去重后只投一次并注明。新增可选 `meta: {type?, pri?, ref?}` 信封：渲染进 banner **首行**紧凑字段（只出现调用方给的键），`ref` 超 16 字符按码点截断并在返回文案注明截断前后，枚举外的值 / 未定义字段 / 非对象 / 空 ref / 含换行 ref 一律明确参数错误（不静默丢弃、不部分采用）；**`source` 仍是恰好三成员**（V10 红线不动，信封只走正文 banner），fan-out 时所有目标共享同一 meta。§3.5 busy 预判：投递后返回文案追加目标忙碌状态（运行中 → 「目标回合已运行 N 分钟（steer 注入当前回合）；需新回合语义请等其空闲」，N 取 M1 的 `turnStartedAt`，读不到该时间戳则只给 steer 语义；空闲 → 原文案不变）。顺带 4 项 M2 评审质量修复：**R1** retire 信任清理改为对话框确认后**重新 `policy.get()` 再按最新视图过滤写回**（读-改-写窗口从对话框时长缩到毫秒级；对话框期间新增的 pair/信任引用不再被回滚删除，对话框里列出的引用若已被别的变更删掉也不再计入）；**R2** `host-half.test.mjs` 的 TTL 断言不再依赖墙钟（注册前捕获时钟，断言 `expiresAt > createdAt` 且 `expiresAt > 捕获值`，断言语义不变）；**R3** 补 `__testing.applyRetire` 的两条错误分支断言（角色不存在、角色已空缺；纯函数 + 工具级各一组）；**R4** `team_link_team_read` 的 `decisions` baseHash 标注为「仅供参考/审计」（只有 `discipline` 的 hash 是乐观锁），工具 description 与返回文本同步修正。**本轮不含 M4（rotation / 令牌 / 迁移 / provisional）的任何实现**。`host-half.test.mjs` 净增 **76** 项断言（235 → 311，当次实测），既有 235 项不回归（client 42 项不变，合计 353）。
 - **0.3.2（M2，未发布；`package.json` 的版本号随发布统一 bump）** — roster（团队身份注册表）+ 团队黑板（设计 `docs/team-upgrade-design-2026-09-17.md` §3.3 全节 + §4.1 黑板写边界 + §5.1 U4）：新增 `team_link_roster`（get / upsert-team / set-role / retire）、`team_link_team_read`、`team_link_team_append` 三个工具；设置命名空间 `team-link` 新增 `teams` 键（name `[a-z0-9-]+` 唯一、createdAt、workspace、policy.writer、roles[role/current/pending/history]）。写权限：`writer=coordinator`（默认）时只有该团队 `coordinator` 角色的**现任**会话可写，现任空缺时会话路径一律拒绝（提示走设置 UI），`writer=any` 时任何会话可写，读永远开放；`retire` 按 §3.3.2 v1.3 逐字实现为「仅现任协调者会话或用户发起」，效果是 current 置空 + 版本史记退役，之后可选**一个**用户确认对话框列出全部指向退役会话的 `pairs`（双向）/`trustedSenders`/`rememberTargets`，确认才清理（无确认服务则跳过清理、仅退役并在返回里说明）；`set-role` **不迁移 pairs**（信任迁移保留给 M4 rotation）。镜像：每次 roster 变更在同一调用内 best-effort 写 `<workspace>/team/<name>/roster.md`（人可读，失败只告警——settings 始终是事实源）。黑板：`team/<name>/decisions.md` 只追加（`seq | ISO 时间 | author-session-id | 正文`，seq 由插件分配、单调递增）、`discipline.md` 整文件替换（必须携带 `team_read` 返回的 `baseHash`，不匹配即拒绝并要求重读），两者单行上限 **500** 字符（§4.1，按码点计）；黑板**无写权限门**（任何会话可写），写入者记在行内 author。团队名 `[a-z0-9-]+` 白名单 + file 枚举白名单（一律 `path.join`，防路径穿越）；所有新增模型可见输出仍过 `wellFormed`，文件读写异常一律转成可读文本而不穿透工具调用。**本轮不含 M3（broadcast/信封 banner）与 M4（rotation/pending/令牌）的任何实现**——`pending` 只在 schema 与归一化里原样保留。`host-half.test.mjs` 净增 **67** 项断言（168 → 235，当次实测），既有 168 项不回归（client 42 项不变，合计 277）；非空断言用变异验证：把 writer 门与 baseHash 乐观锁各打一个洞后 host 红 8 项，还原即全绿。
 - **0.3.1（M1，未发布；`package.json` 的版本号随发布统一 bump）** — 活性面 + 跨会话看门狗最小版（设计 `docs/team-upgrade-design-2026-09-17.md` §3.1/§3.2/§3.7）：`team_link_list_sessions` 每个会话行新增 `活性：` 信号行（verdict 五态 ok / goal-disarmed / silent-idle / long-running / dead、goal phase/activation/轮次与 blockedReason、静默时长、读数时间戳），goal 状态经 `ctx.get("goals")` **可选注入**（服务缺失时显示 `?`，插件功能完整降级）；行尾统一附「（读数 <时间>，>2min 作废）」。新增 `team_link_watch`（register / list / clear）：只能给自己注册、拒绝 target 含自己的自指、单会话 ≤3 个、`silentMinutes>=10` / `intervalMinutes>=5`（默认 5）/ `ttlHours<=24`（默认 12，到点自清）；巡逻按 §3.7 四态表投递 tick（观察者运行中或 armed-active 不 tick；目标 armed-active 不 tick；目标 active-but-disarmed 立即 tick 且文案带诊断 + 合规 resume 回路；paused/blocked/complete 不 tick；无 goal 且静默超阈才 tick）；tick 的 `source` 仍是 `{kind: "agent-message", form: "relay", senderSessionId}` 恰好三成员（V10，id 前缀 `slp-wd-`），正文是插件常量模板（只插值目标 id / 读数时间 / 静默时长）；去抖与「观察者=dead」标记为进程内状态不持久化；巡逻定时器随插件 dispose 清理。设置命名空间 `team-link` 新增 `watchdogs` 键（见「策略配置」表）；`host-half.test.mjs` 净增 93 项断言（M1 交付 87 项：U1 判定表与降级、U2 巡逻四态与 dead 分支、U3 source 合规与正文常量化；审计修复轮追加 6 项：dead/running/armed-active 三分支下的过期注册自清——host 75 → 168，当次实测），既有 75 项不回归（client 42 项不变，合计 210）

@@ -84,7 +84,12 @@ function makeUserQuestions(script) {
 				// is still pending, which is how the R1 retire race is reproduced (plugin
 				// state changes between the dialog opening and the write-back).
 				const choice = typeof next === "function" ? await next() : next;
-				return { answers: [{ id: request.questions[0].id, selected: [choice], custom: undefined }] };
+				// An ARRAY entry is the multi-select answer (the M4 rotation dialog lists every
+				// candidate pair as an option of ONE question); a scalar is the single-select
+				// answer. Every question of a request gets the same scripted selection — which is
+				// exactly one question for every caller in this file.
+				const selected = Array.isArray(choice) ? [...choice] : [choice];
+				return { answers: request.questions.map((question) => ({ id: question.id, selected: [...selected], custom: undefined })) };
 			},
 		},
 		requests,
@@ -1368,6 +1373,323 @@ busyFanEnv.agentFor("session-worker-a").status = "running";
 const busyFanOut = await busyFanEnv.send.execute({ targets: ["session-worker-a", "session-worker-b"], message: "x" }, execFor(busyFanEnv.senderAgent));
 check("§3.5: inside a fan-out the running target's row carries the prediction and the idle one keeps the wake sentence", busyFanOut.includes("目标回合运行中，起始时间不可读（steer 注入当前回合）") && busyFanOut.includes("目标空闲，已唤醒目标会话"));
 check("§3.5: and the fan-out still steers the running target and follows up the idle one", busyFanEnv.calls("session-worker-a").steered.length === 1 && busyFanEnv.calls("session-worker-b").followedup.length === 1);
+
+// ---------------------------------------------------------------------------
+// M4 (§3.6): rotation — two-phase hand-over, domain-limited migration, TTL rollback
+// ---------------------------------------------------------------------------
+
+const SUCCESSOR = "session-new";
+const ROT_SELF = "session-self";
+const ROT_OUTSIDE = "session-outside";
+
+/** The M4 roster: a seated coordinator (session-self) and two live workers. */
+const rotRoles = () => [
+	{ role: "coordinator", current: ROT_SELF, pending: null, history: [{ session: ROT_SELF, from: 1_700_000_000_000, until: null }] },
+	{ role: "worker-a", current: "session-worker-a", pending: null, history: [{ session: "session-worker-a", from: 1_700_000_000_000, until: null }] },
+	{ role: "worker-b", current: "session-worker-b", pending: null, history: [{ session: "session-worker-b", from: 1_700_000_000_000, until: null }] },
+];
+
+/**
+ * M4 fixture: the roster above, three live agents (two workers + the successor)
+ * and the trust state a rotation operates on. `receiveMode: accept` keeps notice
+ * delivery out of the receiver dialog; the notice cases set their mode explicitly.
+ */
+function rotateEnv({ askScript = [], omitUserQuestions = false, pairs = [], trustedSenders = [], rememberTargets = [], blockedSenders = [], receiveMode = "accept", goals, teams } = {}) {
+	const env = setup({
+		sessions: [],
+		useSettings: true,
+		askScript,
+		omitUserQuestions,
+		selfCwd: TEAM_WS,
+		goals,
+		extraAgents: [
+			{ id: "session-worker-a", status: "idle" },
+			{ id: "session-worker-b", status: "idle" },
+			{ id: SUCCESSOR, status: "idle" },
+		],
+	});
+	const ns = env.settings.namespaces.get("team-link");
+	ns.data.teams = structuredClone(teams ?? [{ name: "night-shift", createdAt: 1_700_000_000_000, workspace: TEAM_WS, policy: { writer: "coordinator" }, roles: rotRoles() }]);
+	ns.data.pairs = structuredClone(pairs);
+	ns.data.trustedSenders = structuredClone(trustedSenders);
+	ns.data.rememberTargets = structuredClone(rememberTargets);
+	ns.data.blockedSenders = structuredClone(blockedSenders);
+	ns.data.receiveMode = receiveMode;
+	return {
+		...env,
+		ns,
+		rotate: env.tool("team_link_rotate"),
+		roster: env.tool("team_link_roster"),
+		send: env.tool("team_link_send"),
+		list: env.tool("team_link_list_sessions"),
+		rotation: __testing.rotationFor(env.ctx),
+		calls: (id) => env.extraCalls.get(id),
+		exec: (id) => execFor(env.agentFor(id)),
+		team: () => ns.data.teams[0],
+		role: (name = "coordinator") => ns.data.teams[0].roles.find((entry) => entry.role === name),
+	};
+}
+
+const rotPair = (id) => ({ a: ROT_SELF, b: id, createdAt: 1 });
+const pairSummary = (env) => (env.ns.data.pairs ?? []).map((pair) => `${pair.a}↔${pair.b}${pair.provisional === true ? "(provisional)" : ""}`).sort().join(" ");
+const tokenOf = (text) => (String(text).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/u) ?? [])[0];
+
+// --- prepare (Phase A): token, snapshot, freeze broadcast --------------------
+
+const rotA = rotateEnv({
+	askScript: [["session-worker-a"]],
+	pairs: [rotPair("session-worker-a"), rotPair("session-worker-b"), rotPair(ROT_OUTSIDE), { a: "session-worker-a", b: "session-worker-b", createdAt: 2 }],
+	trustedSenders: [ROT_SELF, "session-worker-a"],
+	rememberTargets: [ROT_SELF, "session-worker-b"],
+});
+check("M4: the rotation tool is registered", rotA.rotate !== undefined && rotA.list !== undefined);
+
+const rotPrep = await rotA.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR, note: "INJECT_ME 载荷" }, execFor(rotA.senderAgent));
+const rotToken = tokenOf(rotPrep);
+check("M4 prepare: the incumbent gets the hand-over package and a fresh one-time token", rotPrep.includes("换届包已就绪") && typeof rotToken === "string" && rotToken.length === 36);
+check("M4 prepare: the token is bound to (team, role, successor) with the 30-minute TTL (§3.6.1 原则 1)", (() => {
+	const pending = rotA.role().pending;
+	return pending.session === SUCCESSOR && pending.token === rotToken && pending.team === "night-shift" && pending.role === "coordinator" && pending.expiresAt - pending.createdAt === 30 * 60000 && Array.isArray(pending.migratedPairs) && pending.migratedPairs.length === 0;
+})());
+check("M4 prepare: rotationBackup snapshots the pre-rotation trust state (撤销依据)", (() => {
+	const backup = rotA.team().rotationBackup;
+	return backup !== null && backup.at > 0 && backup.pairs.length === 4 && backup.trustedSenders.length === 2 && backup.rememberTargets.length === 2 && backup.roster.roles.length === 3;
+})());
+check("M4 prepare: the guidance names the TTL, the model-drafted hand-over and the goal hint (§3.6.2)", rotPrep.includes("30 分钟内有效") && rotPrep.includes("机制与判断分离") && rotPrep.includes("/goal resume") && rotPrep.includes("armed-active = 内建心跳"));
+check("M4 prepare: the result states that only the mask is rendered from now on", rotPrep.includes(`tok-${rotToken.slice(0, 4)}…${rotToken.slice(-4)}`));
+
+const freezeMsg = rotA.calls("session-worker-a").followedup[0];
+check("M4 prepare: rotation-freeze is the §4.2 constant check-list", freezeMsg !== undefined && freezeMsg.content[0].text.includes("[rotation-freeze]") && freezeMsg.content[0].text.includes("停掉本会话的哨兵/看门狗与后台 job") && freezeMsg.content[0].text.includes("确认没有在飞的动作") && freezeMsg.content[0].text.includes("状态已冻结") && freezeMsg.content[0].text.includes("等待交接结果通知"));
+check("M4 prepare: the freeze reaches every other team member, and no sender-side approval was asked", rotA.calls("session-worker-a").followedup.length === 1 && rotA.calls("session-worker-b").followedup.length === 1 && rotA.uq.requests.length === 0);
+check("M4 红线: a notice rides the audited three-member source (V10)", Object.keys(freezeMsg.source).length === 3 && freezeMsg.source.kind === "agent-message" && freezeMsg.source.form === "relay" && freezeMsg.source.senderSessionId === ROT_SELF);
+check("M4 红线: no model-supplied text can reach a notice body (机制与判断分离)", !freezeMsg.content[0].text.includes("INJECT_ME") && !rotA.calls("session-worker-b").followedup[0].content[0].text.includes("INJECT_ME"));
+
+const rotMirror = await readFile(mirrorFile, "utf8");
+const rotGet = await rotA.roster.execute({ action: "get", team: "night-shift" }, execFor(rotA.senderAgent));
+check("M4 令牌掩码: the roster.md mirror renders only the masked token (M2 评审 #3)", rotMirror.includes(`tok-${rotToken.slice(0, 4)}…${rotToken.slice(-4)}`) && !rotMirror.includes(rotToken));
+check("M4 令牌掩码: roster get renders only the masked token too, and names the binding", rotGet.includes("掩码") && rotGet.includes(`tok-${rotToken.slice(0, 4)}…${rotToken.slice(-4)}`) && rotGet.includes("绑定 team=night-shift role=coordinator") && !rotGet.includes(rotToken));
+check("M4 令牌掩码: the plaintext token exists exactly once — in the prepare result", rotPrep.includes(rotToken) && !rotMirror.includes(rotToken) && !rotGet.includes(rotToken));
+
+// --- claim (Phase B): the single dialog, domain-limited migration -----------
+
+const rotClaim = await rotA.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: rotToken, note: "夜班接班" }, rotA.exec(SUCCESSOR));
+check("M4 claim: ONE dialog lists every in-domain candidate as a multi-select option (逐项勾选 + 整批确认)", (() => {
+	const ask = rotA.uq.requests[0];
+	return ask !== undefined && ask.questions.length === 1 && ask.questions[0].multiSelect === true && ask.questions[0].options.map((option) => option.label).join(",") === "session-worker-a,session-worker-b";
+})());
+check("M4 claim: the dialog states the blast radius — bypassed gates, dropped out-of-domain pairs", (() => {
+	const detail = rotA.uq.requests[0].questions[0].detail;
+	return detail.includes("绕过两道批准门") && detail.includes(ROT_OUTSIDE) && detail.includes("对端不在本团队域内");
+})());
+check("M4 claim: the checked pair is migrated as a ratified channel, the unchecked one is not", rotClaim.includes("已获在场确认") && rotClaim.includes("勾选 1 / 候选 2 条") && rotClaim.includes("session-worker-a ↔ session-self → 已迁移为 session-worker-a ↔ session-new（正式通道）") && rotClaim.includes("session-worker-b ↔ session-self → 未迁移（未勾选）"));
+check("M4 claim: a pair whose counterpart is outside the roster is never migrated (§3.6.1 原则 2)", rotClaim.includes(`${ROT_OUTSIDE} ↔ session-self → 未迁移（对端不在本团队域内（§3.6.1 原则 2））`));
+check("M4 claim: the resulting trust state is exactly kept + migrated", pairSummary(rotA) === "session-new↔session-worker-a session-worker-a↔session-worker-b");
+check("M4 claim: revocation is symmetric — pairs/trustedSenders/rememberTargets of the retiree all go (§3.6.1 原则 3)", !rotA.ns.data.pairs.some((pair) => pair.a === ROT_SELF || pair.b === ROT_SELF) && !rotA.ns.data.trustedSenders.includes(ROT_SELF) && !rotA.ns.data.rememberTargets.includes(ROT_SELF) && rotClaim.includes("pairs 3 条已全部清除（其中迁移 1 条）") && rotClaim.includes("trustedSenders 移除 1 项") && rotClaim.includes("rememberTargets 移除 1 项"));
+check("M4 claim: the roster settles — current, closed/open tenure with the note, rotationAt, pending cleared", (() => {
+	const entry = rotA.role();
+	return entry.current === SUCCESSOR && entry.pending === null && entry.provisional === null && entry.rotationAt > 0 && entry.history.length === 2 && entry.history[0].session === ROT_SELF && typeof entry.history[0].until === "number" && entry.history[0].note === "夜班接班" && entry.history[1].session === SUCCESSOR && entry.history[1].until === null;
+})());
+check("M4 claim: rotation-done is broadcast with the ratified status, from the new incumbent", (() => {
+	const done = rotA.calls("session-worker-a").followedup[1];
+	return done !== undefined && done.content[0].text.includes("[rotation-done]") && done.content[0].text.includes("信任迁移状态：已批准") && done.content[0].text.includes(`旧任 ${ROT_SELF} → 新任 ${SUCCESSOR}`) && done.source.senderSessionId === SUCCESSOR;
+})());
+check("M4 claim: a ratified migration opens no rollback window", rotClaim.includes("迁移的 pairs 已是正式通道（无回退窗口）") && rotA.role().provisional === null);
+
+const rotSend = await rotA.send.execute({ targetSessionId: "session-worker-a", message: "交接后的正式通道" }, rotA.exec(SUCCESSOR));
+check("M4: a delivery over the migrated channel is a plain paired delivery (no provisional suffix)", rotSend.includes("已投递到") && rotSend.includes("已配对通道") && !rotSend.includes("provisional"));
+
+const rotAgain = await rotA.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: rotToken }, rotA.exec(SUCCESSOR));
+check("U6: a token is single-use — a replay after a completed claim is refused (成功即作废)", rotAgain.includes("没有 pending") && rotAgain.includes("成功即作废"));
+
+// --- prepare preconditions and the anti-storm rate limit --------------------
+
+const gateEnv = rotateEnv();
+const notIncumbent = await gateEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, gateEnv.exec("session-worker-a"));
+check("U6: prepare is refused for every session but the incumbent (§3.6.2 前置)", notIncumbent.includes("只有该角色的现任会话 session-self 可以发起换届") && gateEnv.role().pending === null);
+const selfRot = await gateEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: ROT_SELF }, execFor(gateEnv.senderAgent));
+check("U6: a self-succession is refused (it would revoke and re-grant the same session's trust)", selfRot.includes("继任者不能是现任自己") && selfRot.includes("retire") && gateEnv.role().pending === null);
+const noSuccessor = await gateEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator" }, execFor(gateEnv.senderAgent));
+check("U6: prepare without a successor is refused with the §3.6.4 pointer", noSuccessor.includes("需要 successor") && noSuccessor.includes("§3.6.4") && noSuccessor.includes("team_link_roster action=retire"));
+const rotGhostTeam = await gateEnv.rotate.execute({ action: "prepare", team: "no-such-team", role: "coordinator", successor: SUCCESSOR }, execFor(gateEnv.senderAgent));
+check("U6: an unknown team refuses prepare", rotGhostTeam.includes("不在注册表中"));
+const ghostRole = await gateEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "ghost", successor: SUCCESSOR }, execFor(gateEnv.senderAgent));
+check("U6: an unknown role refuses prepare", ghostRole.includes("没有角色 ghost"));
+const starRole = await gateEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "*", successor: SUCCESSOR }, execFor(gateEnv.senderAgent));
+check("R6: the addressing grammar's reserved word is refused as a role name here too", starRole.includes("寻址文法保留字"));
+const rotBadAction = await rejects(gateEnv.rotate, { action: "rotate" }, execFor(gateEnv.senderAgent));
+check("U6: the action set is closed to the two phases", rotBadAction instanceof Error);
+
+const rateEnv = rotateEnv();
+const firstPrep = await rateEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rateEnv.senderAgent));
+const secondPrep = await rateEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rateEnv.senderAgent));
+check("U6: a second prepare inside the 10-minute window is refused (防换届风暴)", firstPrep.includes("换届包已就绪") && secondPrep.includes("换届速率限制") && secondPrep.includes("rateLimit(team, role, 10min)") && secondPrep.includes("窗口剩余约"));
+const { rotationRateLimited } = __testing;
+const RL_NOW = 1_700_000_000_000;
+check("U6: the rate limit is a pure function of the pending and rotation timestamps", rotationRateLimited({ pending: { createdAt: RL_NOW - 60000, expiresAt: RL_NOW + 29 * 60000 }, rotationAt: 0 }, RL_NOW).limited === true
+	&& rotationRateLimited({ pending: { createdAt: RL_NOW - 11 * 60000, expiresAt: RL_NOW + 19 * 60000 }, rotationAt: 0 }, RL_NOW).limited === false
+	&& rotationRateLimited({ pending: null, rotationAt: RL_NOW - 60000 }, RL_NOW).limited === true
+	&& rotationRateLimited({ pending: null, rotationAt: RL_NOW - 11 * 60000 }, RL_NOW).limited === false
+	&& rotationRateLimited(null, RL_NOW).limited === false);
+
+// --- claim preconditions: token, successor identity, binding, expiry --------
+
+const rotClaimEnv = rotateEnv({ pairs: [rotPair("session-worker-a"), rotPair("session-worker-b")] });
+const rotTokenC = tokenOf(await rotClaimEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rotClaimEnv.senderAgent)));
+const rotWrongToken = await rotClaimEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: "00000000-0000-0000-0000-000000000000" }, rotClaimEnv.exec(SUCCESSOR));
+check("U6: a wrong token is refused and nothing moves", rotWrongToken.includes("令牌不匹配") && rotClaimEnv.role().current === ROT_SELF && pairSummary(rotClaimEnv) === "session-self↔session-worker-a session-self↔session-worker-b");
+const rotMaskedToken = await rotClaimEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: __testing.maskToken(rotTokenC) }, rotClaimEnv.exec(SUCCESSOR));
+check("U6: the masked rendering is not a token (the mask is a rendering, not a credential)", rotMaskedToken.includes("令牌不匹配") && rotMaskedToken.includes("掩码形式"));
+const rotWrongSession = await rotClaimEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: rotTokenC }, execFor(rotClaimEnv.senderAgent));
+check("U6: only the pending's successor session may claim (§3.6.1 原则 1)", rotWrongSession.includes("只有 pending 指定的继任者会话 session-new 可以认领") && rotClaimEnv.role().current === ROT_SELF);
+
+const rotBindRoleEnv = rotateEnv();
+rotBindRoleEnv.role().pending = { session: SUCCESSOR, token: "bind-token", team: "night-shift", role: "worker-a", expiresAt: Date.now() + 600000, createdAt: Date.now() };
+const rotMismatchRole = await rotBindRoleEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: "bind-token" }, rotBindRoleEnv.exec(SUCCESSOR));
+check("U6: a token bound to another role is refused (绑定三元组)", rotMismatchRole.includes("令牌绑定不匹配") && rotMismatchRole.includes("role=worker-a"));
+const rotBindTeamEnv = rotateEnv();
+rotBindTeamEnv.role().pending = { session: SUCCESSOR, token: "bind-token-2", team: "day-shift", role: "coordinator", expiresAt: Date.now() + 600000, createdAt: Date.now() };
+const rotMismatchTeam = await rotBindTeamEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: "bind-token-2" }, rotBindTeamEnv.exec(SUCCESSOR));
+check("U6: ... and a token bound to another team is refused too", rotMismatchTeam.includes("令牌绑定不匹配") && rotMismatchTeam.includes("team=day-shift"));
+
+const rotExpiredEnv = rotateEnv({ pairs: [rotPair("session-worker-a"), rotPair("session-worker-b")] });
+rotExpiredEnv.role().pending = { session: SUCCESSOR, token: "expired-token", team: "night-shift", role: "coordinator", expiresAt: Date.now() - 1000, createdAt: Date.now() - 31 * 60000, migratedPairs: [] };
+const rotExpiredClaim = await rotExpiredEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: "expired-token" }, rotExpiredEnv.exec(SUCCESSOR));
+check("U6: an expired token is refused, the pending is cancelled and the old incumbent stays current (评审 #4)", rotExpiredClaim.includes("令牌已过期") && rotExpiredClaim.includes("冻结解除") && rotExpiredEnv.role().pending === null && rotExpiredEnv.role().current === ROT_SELF && rotExpiredEnv.ns.data.pairs.length === 2);
+const rotCancelMsg = rotExpiredEnv.calls("session-worker-a").followedup.at(-1);
+check("U6 常量文案: rotation-cancelled says 旧任仍为 current / 令牌过期未认领 / 解除冻结", rotCancelMsg !== undefined && rotCancelMsg.content[0].text.includes("[rotation-cancelled]") && rotCancelMsg.content[0].text.includes(`旧任 ${ROT_SELF} 仍为 current`) && rotCancelMsg.content[0].text.includes("令牌过期未认领") && rotCancelMsg.content[0].text.includes("解除冻结"));
+
+// --- the unattended path: provisional trust and the 24h rollback ------------
+
+const rotProvEnv = rotateEnv({ omitUserQuestions: true, pairs: [rotPair("session-worker-a"), rotPair("session-worker-b")] });
+const rotProvToken = tokenOf(await rotProvEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rotProvEnv.senderAgent)));
+const rotProvClaimAt = Date.now();
+const rotProvClaim = await rotProvEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: rotProvToken }, rotProvEnv.exec(SUCCESSOR));
+check("U6: with no confirm service every in-domain pair migrates, and it is provisional", rotProvClaim.includes("确认服务（userQuestions）不可用") && pairSummary(rotProvEnv) === "session-new↔session-worker-a(provisional) session-new↔session-worker-b(provisional)");
+check("U6: the provisional pairs carry the 24h rollback deadline", (() => {
+	const pair = rotProvEnv.ns.data.pairs.find((entry) => entry.b === "session-worker-a");
+	return pair.provisional === true && pair.expiresAt - rotProvClaimAt > 24 * 3600000 - 60000 && pair.expiresAt - rotProvClaimAt <= 24 * 3600000;
+})());
+check("U6: the roster keeps the open ratification window, and the claim says 待批准(24h)", (() => {
+	const entry = rotProvEnv.role();
+	return entry.current === SUCCESSOR && entry.pending === null && entry.provisional !== null && entry.provisional.session === SUCCESSOR && entry.provisional.expiresAt > rotProvClaimAt && rotProvClaim.includes("信任迁移状态：待批准(24h)") === false;
+})());
+check("U6 常量文案: the done notice of an unattended rotation says 待批准(24h)", rotProvEnv.calls("session-worker-a").followedup[1].content[0].text.includes("信任迁移状态：待批准(24h)"));
+
+const rotProvSend = await rotProvEnv.send.execute({ targetSessionId: "session-worker-a", message: "临时通道" }, rotProvEnv.exec(SUCCESSOR));
+check("U6 provisional 可见面: a delivery over a provisional channel carries the §3.6.2 suffix", rotProvSend.includes("（provisional 通道，24h 内未批准自动回退）"));
+check("U6 provisional 可见面: the banner keeps the §3.4 envelope shape (no provisional field)", (() => {
+	const msg = rotProvEnv.calls("session-worker-a").followedup.at(-1);
+	return !msg.content[0].text.split("\n")[0].includes("provisional") && Object.keys(msg.source).length === 3;
+})());
+
+const rotListEnv = (() => {
+	const env = setup({ sessions: [{ header: { id: "session-worker-a", createdAt: 1000, cwd: CWD }, live: true, persisted: true }], useSettings: true, selfCwd: CWD, extraAgents: [{ id: "session-worker-a", status: "idle" }] });
+	const ns = env.settings.namespaces.get("team-link");
+	ns.data.pairs = [{ a: SUCCESSOR, b: "session-worker-a", createdAt: 1, provisional: true, expiresAt: Date.now() + 3600000 }];
+	return { ...env, ns };
+})();
+const rotListOut = await rotListEnv.tool("team_link_list_sessions").execute({}, execFor(rotListEnv.senderAgent));
+check("U6 provisional 可见面: list_sessions marks the unratified channel on the session row (§3.6.2 评审 #3)", rotListOut.includes("provisional 配对 1 条") && rotListOut.includes("24h 内未批准自动回退"));
+check("U6 provisional 可见面: the marker sits before the reading stamp, so the row still ends with the stamp", /- session-worker-a[^\n]*provisional 配对 1 条（换届临时信任：24h 内未批准自动回退，见 team_link_roster）（读数 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，>2min 作废）/u.test(rotListOut));
+
+const rotRollbackNow = rotProvClaimAt + 24 * 3600000 + 60000;
+const rotRollbackSweep = await rotProvEnv.rotation.sweep({ now: rotRollbackNow, askReceiver: false });
+check("U6: at the 24h mark the sweep deletes the provisional pairs (评审 #5)", rotRollbackSweep.expired.length === 1 && rotProvEnv.ns.data.pairs.length === 0 && pairSummary(rotProvEnv) === "");
+check("U6: history records the unratified rollback and the window closes", (() => {
+	const entry = rotProvEnv.role();
+	const last = entry.history.at(-1);
+	return last.session === SUCCESSOR && last.note === "provisional 未批准过期" && last.until === rotRollbackNow && entry.provisional === null && entry.pending === null;
+})());
+check("U6: the new incumbent stays current after the rollback — the rotation fact stands (评审 #5 终态)", rotProvEnv.role().current === SUCCESSOR);
+const rotExpiredMsg = rotProvEnv.calls("session-worker-a").followedup.at(-1);
+check("U6 常量文案: rotation-expired states the rollback, the retained incumbent and the return to the gates", rotExpiredMsg.content[0].text.includes("[rotation-expired]") && rotExpiredMsg.content[0].text.includes("24h 内未获批准，已自动回退") && rotExpiredMsg.content[0].text.includes(`${SUCCESSOR} 仍为 current`) && rotExpiredMsg.content[0].text.includes("正常过门"));
+const rotRollbackSend = await rotProvEnv.send.execute({ targetSessionId: "session-worker-a", message: "回退之后" }, rotProvEnv.exec(SUCCESSOR));
+check("U6: after the rollback the channel is gone — a send goes through the normal gates again", rotRollbackSend.includes("确认服务（userQuestions）不可用") && !rotRollbackSend.includes("provisional 通道"));
+
+// --- claim idempotency (the crash window between migration and settlement) --
+
+const rotReplayEnv = rotateEnv({ pairs: [{ a: SUCCESSOR, b: "session-worker-a", createdAt: 5 }] });
+rotReplayEnv.role().current = SUCCESSOR;
+rotReplayEnv.role().pending = {
+	session: SUCCESSOR,
+	token: "replay-token",
+	team: "night-shift",
+	role: "coordinator",
+	expiresAt: Date.now() + 600000,
+	createdAt: Date.now(),
+	migratedPairs: [{ a: SUCCESSOR, b: "session-worker-a", createdAt: 5, provisional: false, expiresAt: 0 }],
+};
+const rotReplayOut = await rotReplayEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: "replay-token" }, rotReplayEnv.exec(SUCCESSOR));
+check("U6: a replay returns the recorded migration list instead of migrating again (claim 幂等)", rotReplayOut.includes("claim 重放") && rotReplayOut.includes("不重复迁移") && rotReplayOut.includes("session-worker-a ↔ session-new"));
+check("U6: the replay leaves the trust state byte-for-byte alone (no duplicate pair, no second revocation)", pairSummary(rotReplayEnv) === "session-new↔session-worker-a" && rotReplayEnv.ns.data.pairs.length === 1);
+check("U6: the replay finishes the bookkeeping — the pending is gone", rotReplayEnv.role().pending === null);
+check("U6: the replay re-emits rotation-done so a crash cannot leave the team frozen", rotReplayEnv.calls("session-worker-a").followedup.at(-1).content[0].text.includes("[rotation-done]"));
+
+const rotStaleEnv = rotateEnv();
+rotStaleEnv.role().current = "session-worker-a";
+rotStaleEnv.role().pending = { session: SUCCESSOR, token: "stale-token", team: "night-shift", role: "coordinator", expiresAt: Date.now() + 600000, createdAt: Date.now(), migratedPairs: [{ a: SUCCESSOR, b: "session-worker-b", createdAt: 5, provisional: false, expiresAt: 0 }] };
+const rotStaleOut = await rotStaleEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: "stale-token" }, rotStaleEnv.exec(SUCCESSOR));
+check("U6: a replay whose role was re-assigned clears the leftover silently instead of broadcasting a false rotation-done", rotStaleOut.includes("现任已另行变更") && rotStaleEnv.role().pending === null && rotStaleEnv.calls("session-worker-a").followedup.length === 0);
+
+// --- the internal broadcast path: block list, sweep mode, constant bodies ---
+
+const rotBlockedEnv = rotateEnv({ pairs: [rotPair("session-worker-a"), rotPair("session-worker-b")], blockedSenders: [ROT_SELF] });
+const rotBlockedPrep = await rotBlockedEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rotBlockedEnv.senderAgent));
+check("M4 广播路径: the explicit block still beats an internal notice (no sender gate, but no override either)", rotBlockedPrep.includes("rotation-freeze") && (rotBlockedPrep.match(/已屏蔽来自当前会话的消息/gu) ?? []).length === 2 && rotBlockedEnv.calls("session-worker-a").followedup.length === 0 && rotBlockedEnv.calls("session-worker-b").followedup.length === 0);
+
+// The confirmation service IS available here: the point of the case is that the
+// sweep must not USE it (no dialog is opened, no patrol blocked), which the
+// request log proves far better than a refusal text.
+const rotAskEnv = rotateEnv({ receiveMode: "ask" });
+rotAskEnv.role().pending = { session: SUCCESSOR, token: "ask-token", team: "night-shift", role: "coordinator", expiresAt: Date.now() - 1000, createdAt: Date.now() - 31 * 60000, migratedPairs: [] };
+const rotAskSweep = await rotAskEnv.rotation.sweep({ now: Date.now(), askReceiver: false });
+check("M4 广播路径: a sweep-originated notice never opens a dialog — an ask receiver is skipped with a readable row", rotAskSweep.lines.join("\n").includes("不弹确认框") && rotAskEnv.uq.requests.length === 0 && rotAskEnv.calls("session-worker-a").followedup.length === 0 && rotAskEnv.role().pending === null);
+
+const { freezeNotice: rotFreezeNotice, doneNotice: rotDoneNotice, cancelledNotice: rotCancelledNotice, expiredNotice: rotExpiredNotice, maskToken: rotMaskToken, teamMembers: rotTeamMembers, planRotationMigration: rotPlanMigration, applyRotationTrust: rotApplyTrust, rotateGate: rotRotateGate, readRoleName: rotReadRoleName } = __testing;
+const rotFreezeText = rotFreezeNotice("night-shift", "coordinator", ROT_SELF, SUCCESSOR, 1700000000000);
+check("M4 常量文案: rotation-freeze is the §4.2 check-list (停哨兵/后台 job → 确认无在飞 → 冻结回报 → 等待交接)", rotFreezeText.includes("停掉本会话的哨兵/看门狗与后台 job") && rotFreezeText.includes("确认没有在飞的动作") && rotFreezeText.includes("状态已冻结") && rotFreezeText.includes("等待交接结果通知"));
+check("M4 常量文案: rotation-done carries the ratified/provisional status verbatim", rotDoneNotice("t", "coordinator", "a", "b", "已批准", 1).includes("信任迁移状态：已批准") && rotDoneNotice("t", "coordinator", "a", "b", "待批准(24h)", 1).includes("信任迁移状态：待批准(24h)"));
+check("M4 常量文案: rotation-expired names the rollback, the retained incumbent and the honesty clause", rotExpiredNotice("t", "coordinator", SUCCESSOR, 1).includes("已自动回退") && rotExpiredNotice("t", "coordinator", SUCCESSOR, 1).includes("仍为 current") && rotDoneNotice("t", "coordinator", "a", "b", "待批准(24h)", 1).includes("不可回收"));
+check("M4 常量文案: an interpolated id is scrubbed to a single line before it enters a notice body", !rotFreezeText.includes("\n") && rotFreezeNotice("team", "co\nordinator", ROT_SELF, SUCCESSOR, 1).includes("co_ordinator"));
+check("M4 令牌掩码: the mask is tok-head4…tail4 (§3.6.2 example shape)", rotMaskToken("1a2b3c4d-0000-4000-8000-9f0e1d2c") === "tok-1a2b…1d2c" && rotMaskToken("abc") === "tok-…");
+check("M4: a prepare gate follows the incumbent, whatever the writer policy says", rotRotateGate({ name: "t" }, { role: "coordinator", current: "s1" }, "s2").error !== undefined && rotRotateGate({ name: "t" }, { role: "coordinator", current: "s1" }, "s1").ok === true && rotRotateGate({ name: "t" }, { role: "coordinator", current: null }, "s1").error.includes("空缺"));
+
+const rotPureTeam = {
+	name: "night-shift", createdAt: 1, workspace: "", policy: { writer: "coordinator" }, rotationBackup: null,
+	roles: [
+		{ role: "coordinator", current: ROT_SELF, pending: null, rotationAt: 0, provisional: null, history: [] },
+		{ role: "worker-a", current: "session-worker-a", pending: null, rotationAt: 0, provisional: null, history: [] },
+		{ role: "vacant", current: null, pending: null, rotationAt: 0, provisional: null, history: [] },
+	],
+};
+check("M4: teamMembers is the filled roles only, deduplicated", rotTeamMembers(rotPureTeam).join(",") === `${ROT_SELF},session-worker-a`);
+const rotPlan = rotPlanMigration({ pairs: [rotPair("session-worker-a"), rotPair(ROT_OUTSIDE), { a: ROT_SELF, b: SUCCESSOR, createdAt: 3 }, { a: "session-worker-a", b: "session-worker-b", createdAt: 4 }] }, { members: new Set(rotTeamMembers(rotPureTeam)), retiree: ROT_SELF, successor: SUCCESSOR });
+check("M4: the migration plan keeps in-domain counterparts only and reports the drops", rotPlan.candidates.length === 1 && rotPlan.candidates[0].other === "session-worker-a" && rotPlan.dropped.length === 2 && rotPlan.dropped.some((item) => item.reason.includes("团队域")) && rotPlan.dropped.some((item) => item.reason.includes("继任者")));
+const rotTrustOut = rotApplyTrust({ pairs: [rotPair("session-worker-a"), rotPair(ROT_OUTSIDE)], trustedSenders: [ROT_SELF, "x"], rememberTargets: [ROT_SELF, "y"] }, { retiree: ROT_SELF, successor: SUCCESSOR, chosen: rotPlan.candidates, now: 5, provisional: true });
+check("M4: applyRotationTrust migrates the chosen pair provisionally and revokes both lists symmetrically", rotTrustOut.pairs.length === 1 && rotTrustOut.pairs[0].a === SUCCESSOR && rotTrustOut.pairs[0].b === "session-worker-a" && rotTrustOut.pairs[0].provisional === true && rotTrustOut.pairs[0].expiresAt === 5 + 24 * 3600000 && rotTrustOut.trustedSenders.join(",") === "x" && rotTrustOut.rememberTargets.join(",") === "y" && rotTrustOut.removed.length === 2);
+check("R6: readRoleName is the single gate for role names — it refuses the reserved word, not ordinary ones", rotReadRoleName("*").error !== undefined && rotReadRoleName("reviewer").value === "reviewer");
+
+// --- M3 review riders: R5 (fan-out isolation) and R6 (reserved word) --------
+
+const rotR5Env = fanEnv({ pairs: [pairSelf("session-worker-a"), pairSelf("session-worker-b")] });
+rotR5Env.agentFor("session-worker-b").status = "running";
+rotR5Env.agentFor("session-worker-b").steer = () => { throw new Error("steer exploded: R5"); };
+const rotR5Out = await rotR5Env.send.execute({ targets: ["session-worker-a", "session-worker-b"], message: "R5" }, execFor(rotR5Env.senderAgent));
+check("R5: a throwing target becomes its own refused row instead of killing the whole fan-out", rotR5Out.includes("- session-worker-b → refused：发送失败：投递到该目标时异常（steer exploded: R5），其余目标不受影响。"));
+check("R5: the other targets keep their deliveries and the summary line is still produced", rotR5Out.includes("- session-worker-a → delivered") && rotR5Env.calls("session-worker-a").followedup.length === 1 && rotR5Out.includes("汇总：1 投递 / 1 拒绝。"));
+
+const rotStarEnv = teamEnv({ teams: [teamRow({ writer: "any", current: "session-self" })] });
+const rotStarOut = await rotStarEnv.tool("team_link_roster").execute({ action: "set-role", team: "night-shift", role: "*", session: "session-target" }, execFor(rotStarEnv.senderAgent));
+check("R6: set-role refuses the addressing grammar's reserved word and creates no such role", rotStarOut.includes("寻址文法保留字") && rotStarEnv.store()[0].roles.every((entry) => entry.role !== "*"));
+
+// --- §5.3 红线: the plugin never re-arms a goal itself ----------------------
+
+const rotGoalEnv = rotateEnv({ goals: { [SUCCESSOR]: { phase: "active", activation: "disarmed", roundsStarted: 3, maxGoalRounds: 70 } }, pairs: [rotPair("session-worker-a")], askScript: [["session-worker-a"]] });
+let rotResumeCalls = 0;
+rotGoalEnv.ctx.get("goals").resume = () => { rotResumeCalls += 1; };
+const rotGoalPrep = await rotGoalEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rotGoalEnv.senderAgent));
+const rotGoalClaim = await rotGoalEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: tokenOf(rotGoalPrep) }, rotGoalEnv.exec(SUCCESSOR));
+check("M4 红线: a whole rotation never calls goals.resume — the successor is only ADVISED (§3.7 合规回路)", rotResumeCalls === 0 && rotGoalClaim.includes("换届完成") && rotGoalPrep.includes("/goal resume"));
 
 // cleanup
 rmSync(tmpDir, { recursive: true, force: true });

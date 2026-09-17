@@ -181,6 +181,16 @@ check("a long title still yields the stamp", spanText(headSpan(longTitle, "dshsl
 const noStamp = render({ source: { kind: "agent-message", form: "relay", senderSessionId: "session-k" }, content: textOf([relayBody("session-k", undefined, "旧 banner 没有时间")]) }, "slp-77777777-7777-7777-7777-777777777777");
 check("a stamp-less banner shows no time", headSpan(noStamp, "dshsl-relay-when") === undefined);
 
+// 8b. R7 (M3 review): the head line may carry the §3.4 envelope AFTER the stamp
+//     (`… 23:42:05 · type=ruling pri=P0 ref=slp-a1b2]`). The stamp must still be
+//     read, and the envelope fields must not leak into the card body.
+const metaCard = render({ source: { kind: "agent-message", form: "relay", senderSessionId: "session-m" }, content: textOf([relayBody("session-m", "2026-05-05 10:10:10 · type=ruling pri=P0 ref=slp-a1b2", "带信封正文")]) }, "slp-dddddddd-dddd-dddd-dddd-dddddddddddd");
+check("R7: a banner carrying envelope meta still yields its stamp", spanText(headSpan(metaCard, "dshsl-relay-when")) === new Date(2026, 4, 5, 10, 10, 10).toLocaleString());
+check("R7: the envelope fields stay in the banner and out of the card body", bodyTextOf(metaCard) === "带信封正文");
+const metaTitle = render({ source: { kind: "agent-message", form: "relay", senderSessionId: "session-n" }, content: textOf([relayBody("「2026-01-01 12:00:00 的讨论」session-n", "2026-05-06 11:11:11 · type=report pri=P2", "标题含日期且带信封")]) }, "slp-eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
+check("R7: the envelope-aware regex still lets the true stamp win over a date-like title", spanText(headSpan(metaTitle, "dshsl-relay-when")) === new Date(2026, 4, 6, 11, 11, 11).toLocaleString());
+check("R7: a relay without meta keeps its exact previous parse", spanText(headSpan(noId, "dshsl-relay-when")) === new Date(2026, 1, 14, 10, 0, 0).toLocaleString());
+
 // ---------------------------------------------------------------------------
 // header actions: copy + export side by side
 // ---------------------------------------------------------------------------

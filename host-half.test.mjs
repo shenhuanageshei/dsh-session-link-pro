@@ -789,6 +789,34 @@ check("an expired registration cleans itself up (§3.2.3 TTL)", ttlEnv.settings.
 const afterTtl = await ttlEnv.watch.execute({ action: "list" }, execFor(ttlEnv.senderAgent));
 check("the expired registration is gone from the list", afterTtl.includes("共 0 个") && !afterTtl.includes(ttlEntry.id));
 
+// The TTL sweep must be reachable behind every watcher gate (audit D1): the
+// observer-gone / running / armed-active early returns used to run BEFORE the
+// expiry check, so such a registration never cleaned itself up and its empty
+// patrol timer span forever. §3.2.3 puts the sweep first.
+const expiredEnv = (options) => watchdogEnv({ targets: { "session-silent": { events: oneShotSurface(1) } }, ...options });
+
+const ttlDeadEnv = expiredEnv({});
+await ttlDeadEnv.watch.execute({ action: "register", targets: ["session-silent"], ttlHours: 0.001 }, execFor(ttlDeadEnv.senderAgent));
+const ttlDeadEntry = ttlDeadEnv.settings.namespaces.get("team-link").data.watchdogs[0];
+ttlDeadEnv.setHiddenAgent("session-self", true);
+await ttlDeadEnv.watchdog.patrol({ now: ttlDeadEntry.expiresAt + 1 });
+check("an expired registration drops itself even when the observer is gone (D1)", ttlDeadEnv.settings.namespaces.get("team-link").data.watchdogs.length === 0);
+check("the expired registration's patrol timer is gone with it (D1: no empty timer)", ttlDeadEnv.watchdog.timers.size === 0);
+check("the expired registration produces no tick", ttlDeadEnv.senderCalls.followedup.length === 0);
+
+const ttlRunningEnv = expiredEnv({ selfStatus: "running" });
+await ttlRunningEnv.watch.execute({ action: "register", targets: ["session-silent"], ttlHours: 0.001 }, execFor(ttlRunningEnv.senderAgent));
+const ttlRunningEntry = ttlRunningEnv.settings.namespaces.get("team-link").data.watchdogs[0];
+await ttlRunningEnv.watchdog.patrol({ now: ttlRunningEntry.expiresAt + 1 });
+check("an expired registration drops itself while the observer is running (D1)", ttlRunningEnv.settings.namespaces.get("team-link").data.watchdogs.length === 0);
+
+const ttlArmedEnv = expiredEnv({ selfGoal: armedGoal(4) });
+await ttlArmedEnv.watch.execute({ action: "register", targets: ["session-silent"], ttlHours: 0.001 }, execFor(ttlArmedEnv.senderAgent));
+const ttlArmedEntry = ttlArmedEnv.settings.namespaces.get("team-link").data.watchdogs[0];
+await ttlArmedEnv.watchdog.patrol({ now: ttlArmedEntry.expiresAt + 1 });
+check("an expired registration drops itself while the observer is armed-active (D1)", ttlArmedEnv.settings.namespaces.get("team-link").data.watchdogs.length === 0);
+check("the expiry pass delivers no tick either (sweep only, §3.2.3)", ttlArmedEnv.senderCalls.followedup.length === 0);
+
 // --- dispose kills the timers, not the store (plugin lifecycle) ------------
 const disposeEnv = watchdogEnv({ targets: { "session-silent": { events: oneShotSurface(1) } } });
 check("the controller of a context is reachable through the plugin registry", disposeEnv.watchdog !== undefined && typeof disposeEnv.watchdog.patrol === "function");

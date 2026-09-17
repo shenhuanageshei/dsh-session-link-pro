@@ -263,7 +263,7 @@ sequenceDiagram
 清扫有两个触发面：**M1 看门狗的同一个巡逻定时器**（定时器随注册存在——一个看门狗都没注册时它不跑），以及**惰性检查**——每次 `team_link_roster` 触碰、每次 `team_link_rotate` 调用、每次 `team_link_team_read` 读取都会先扫一遍。换言之：**只要团队里还有人读黑板 / 动 roster / 走换届，过期 pending 与过期 provisional 窗口就不会漏**；一个看门狗都没注册、且长时间没有任何人碰这三个工具时，冻结状态要等下一次触碰才解除。
 
 过期 provisional **pairs 的删除不依赖角色记账**（评审 #8）：清扫的写入判据原先只看「有没有角色要写」（pending 清除 / 窗口关闭），而用户完全可以在设置 UI 里手删 `roles[].provisional` 窗口——甚至整行角色或整个团队——把 pairs 留在原地；那种状态下判据永远为假，清扫会提前返回，过期通道既不删也不再失效。现在 doomed pairs 的计算与删除**排在角色记账判据之前**，没有角色记账可写时照样写 pairs 补丁。（投递侧另有独立守门，见上表：即使清扫尚未跑到，过期 pair 也不再算配对。）
-**补批准**的入口是设置 UI：24h 内把该 pair 的 `provisional` 置为 `false`（或删掉 `expiresAt`）即转正式；已回退后不再复得。补批准只改 pair、不改 `roles[].provisional` 窗口——窗口到点时若域内已无待回退的 provisional pair，它就静默关闭（见上表：不记版本史、不广播）。
+**补批准**的入口是设置 UI：24h 内把该 pair 的 `provisional` 置为 `false` 即转正式（**唯一口径**——不要用删 `expiresAt` 的方式：那会留下 `provisional: true` 且永不过期的记录，可见面文案与通道事实不一致）；已回退后不再复得。补批准只改 pair、不改 `roles[].provisional` 窗口——窗口到点时若域内已无待回退的 provisional pair，它就静默关闭（见上表：不记版本史、不广播）。
 
 ### 内部通知与实现裁量点
 

@@ -158,6 +158,8 @@ watchdogs:
 ```ts
 // 插件侧 cordis 定时器（intervalMinutes 粒度）；每个 watcher 独立去抖
 async function patrol(w: Watchdog) {
+  if (now > w.expiresAt) return removeWatchdog(w.id);         // TTL 自清【最先】（审计 D1 修正：观察者已死/
+                                                              // running/armed 的早退不得挡住过期清理，防注册行泄漏）
   const watcher = ctx.agents.get(w.watcherSession);
   if (!watcher) return markWatcherDead(w);                   // 观察者已关闭：只标信号面，不承诺恢复（A4）
   if (watcher.status === "running") return;                  // 绝不打断运行中的观察者（对齐 V7 投递规则）
@@ -169,7 +171,6 @@ async function patrol(w: Watchdog) {
     watcher.followup(tickMessage(t, s));
     markTicked(w.id, t, s.silenceMs);
   }
-  if (now > w.expiresAt) removeWatchdog(w.id);                // TTL 自清（防 runaway）
 }
 
 function tickMessage(t, s) {                                   // 正文为插件常量模板，模型不可注入载荷

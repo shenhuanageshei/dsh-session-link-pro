@@ -633,7 +633,7 @@ function createPolicyStore(ctx) {
 
 #### 9.1.4 测试回归锁（说明真实缺口）
 
-现有 stub **已经覆盖 settings 路径**（`host-half.test.mjs:57-72` 的 `makeSettings()`，且大量断言直接读 `env.settings.namespaces.get("team-link")`）。**缺口不是「有没有 settings 服务」，而是「服务的提供时机」**：stub 在 ctx 构造时同步 `provide`，于是永远复现不出「apply 时 provider 尚未 active」这一生产条件。故新增 U9（§5.1）：先构造 ctx 并跑 apply，**之后再**提供 settings 服务，断言 store 最终挂到 settings 且写入落在 stub 的命名空间数据里——这条用例在修复前必须红。**U9 的 stub 必须忠实模拟 `ctx.inject` 的晚激活语义**（先 apply、后提供并触发回调），否则「确定性」就只被实现者自己写的 stub 验证；真机确认由演练 7 承担。
+现有 stub **已经覆盖 settings 路径**（`host-half.test.mjs:57-72` 的 `makeSettings()`）：当次实测 — **5 处** `useSettings: true` 的 setup（:712 / :816 / :1012 / :1528 / :1752）启用它，全文 **14 处**引用 `env.settings.namespaces`。另须知 `setup()` 的 `useSettings` **默认为 false**（:130），故多数用例走的仍是内存路径。**缺口不是「有没有 settings 服务」，而是「服务的提供时机」**：stub 在 ctx 构造时同步 `provide`，于是永远复现不出「apply 时 provider 尚未 active」这一生产条件。故新增 U9（§5.1）：先构造 ctx 并跑 apply，**之后再**提供 settings 服务，断言 store 最终挂到 settings 且写入落在 stub 的命名空间数据里——这条用例在修复前必须红。**U9 的 stub 必须忠实模拟 `ctx.inject` 的晚激活语义**（先 apply、后提供并触发回调），否则「确定性」就只被实现者自己写的 stub 验证；真机确认由演练 7 承担。
 
 #### 9.1.5 影响面（文件级）
 

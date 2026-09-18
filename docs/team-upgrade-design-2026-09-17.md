@@ -582,6 +582,7 @@ sequenceDiagram
 function createPolicyStore(ctx) {
 	const memory = structuredClone(DEFAULT_POLICY);
 	let scope = null, legacyScope = null;
+	let attachWarned = false;            // 未挂载告警的一次性门
 	let engine = memoryEngine(memory);   // 默认内存引擎：降级红线保持
 
 	function attach(settings) {           // 幂等：只挂一次
@@ -589,11 +590,14 @@ function createPolicyStore(ctx) {
 		try {
 			scope = settings.register(POLICY_NAMESPACE, PolicyConfig, { base: structuredClone(DEFAULT_POLICY) });
 		} catch (error) {
-			ctx.logger?.warn?.(`${PLUGIN_LABEL}: settings register failed (${describeError(error)}) — 状态仅存进程内存`);
+			if (!attachWarned) { attachWarned = true; ctx.logger?.warn?.(`${PLUGIN_LABEL}: settings register failed (${describeError(error)}) — 状态仅存进程内存`); }   // 与 ② 共用一次性门：register 抛错会在惰性重试下反复到达
 			return;
 		}
 		try { legacyScope = settings.register(LEGACY_POLICY_NAMESPACE, PolicyConfig, { base: structuredClone(DEFAULT_POLICY) }); }
-		catch { legacyScope = null; }     // 旧命名空间仍为 best-effort
+		catch (error) {                   // 旧命名空间仍为 best-effort，但失败必须留痕（§5.3 不得静默降级）
+			legacyScope = null;
+			ctx.logger?.warn?.(`${PLUGIN_LABEL}: legacy namespace "${LEGACY_POLICY_NAMESPACE}" unavailable (${describeError(error)}) — 旧数据不会自动迁移`);
+		}
 		engine = settingsEngine(scope);
 		ctx.logger?.info?.(`${PLUGIN_LABEL}: policy store attached to settings namespace "${POLICY_NAMESPACE}"`);
 		void migrateLegacyPolicy();       // 迁移改到「挂上之后」执行，而非 apply 当场
@@ -615,7 +619,9 @@ function createPolicyStore(ctx) {
 		}
 	}
 	// ③ 惰性兜底：get()/update() 每次调用时若 scope === null 再试一次 ctx.get("settings")；
-	//    成功即挂载并记 info；仍失败**不重复告警**（激活期已留一行 warn，保证 U11 的「有且仅有一行」）
+	//    成功即挂载并记 info；仍失败**不重复告警**——注意「未挂载告警」有**两条到达路径**
+	//    （激活时未 active、以及 active 但 register 抛错），二者共用同一个 attachWarned 门，
+	//    否则惰性重试会把 warn 变成无上界告警风暴（U11 的「有且仅有一行」按**整个启动窗口**计）
 
 	return { get, update, migrateLegacyPolicy };
 }
@@ -626,7 +632,7 @@ function createPolicyStore(ctx) {
 - **确定性**：`ctx.inject(["settings"], cb)` 的回调只在服务 active 后运行（cordis 的注入等待语义），时序竞态被结构性消除；同时它不是硬依赖——服务永缺时插件照常加载并降级。
 - **保留快路**：同步提供方（含测试 stub）走 ①，不引入任何异步延迟，既有测试语义不变。
 - **数据一致性**：内存引擎只可能在「启动窗口」内被写入，而此刻尚无活动代理能调用工具；挂载时以 settings 为事实源，若内存期确有非默认值则按与 legacy 迁移同形的规则（仅当 settings 为默认时）并入——该窗口理论不可达，此条作为防御性冗余记录。
-- **留痕**（防复发，红线级）：任何「未能立刻挂载」必须留一行 warn；挂载成功留一行 info。**不得再存在第二次静默回退。**
+- **留痕**（防复发，红线级）：任何「未能立刻挂载」必须留一行 warn——**整个启动窗口合计恰一行**（「激活时未 active」与「active 但 register 抛错」两条到达路径共用同一一次性门，否则惰性重试会让 warn 无上界）；挂载成功留一行 info；旧命名空间 register 失败也留一行（best-effort ≠ 静默）。**不得再存在第二次静默回退。**
 - **调用点迁移**：`migrateLegacyPolicy()` 由「apply 当场调用」改为「attach 之后调用」（apply 当场调用在 ③ 未修时恒为 no-op）。
 - **同类竞态的第三处（会诊 O6，本设计一并覆盖）**：`registerExportRoute`（lib/index.js:3909-3913）同样在 apply 期取 `ctx.get("webServer")` 时点快照；它已有 warn 与安全降级，但**同样受时序支配**——当前之所以导出路由可用，只是因为 webServer 的提供方恰好先于本插件 active（日志中**从未**出现 `:3912` 的 warn 即为此反证）。同一「晚挂 + 重试」模式覆盖：不可用时 `ctx.inject(["webServer"], child => registerExportRoute(child))`。
 - **已评估并否决的备选（会诊 O5）**：把 `"settings"` / `"webServer"` 直接加入 `inject` 数组。否决理由：`inject` 是**硬依赖**——依赖缺失时 cordis 令整个插件 fiber 不激活（`Fiber._refresh` → INACTIVE），本插件会连深链与导出工具一起消失，与 `:3912` 已声明的降级语义相抵；而 `ctx.inject` 与 `inject` 在**确定性**上等价（同样等待 provider 完成 `[Service.init]`，cordis/lib/index.js:1306）。**判决可逆**：若设计评审倾向 `inject`，回退为一行改动。
@@ -664,7 +670,7 @@ function createPolicyStore(ctx) {
 - **创建路径**（团队不存在）时：在**同一次写入**里把 `roles` 初始化为 `[{ role: "coordinator", current: <caller>, pending: null, history: [{ session: <caller>, from: now, until: null, note: "创建者自举" }] }]`。落点：`applyTeamUpsert`（lib/index.js:1399）+ `roleRecord`（:1297）产出规范形状；`TeamRoleConfig` 全字段有默认值，settings 往返安全，**PolicyConfig 零改动**（会诊 O9）。
 - 团队**已存在**时：`roles` 一律不改（保住 `upsert-team` 的幂等契约，使重试安全）；该路径仍过 `writerGate`，故**非现任不可能借此劫持他人团队**。
 - 无 caller（无会话身份）：创建路径本就要求 `exec.agent.id`（:1705 已保证），故不会产生「无人认领的半截团队」；文案随之改为「coordinator 已由创建会话认领」，删除 :1722 的「首任协调者需由用户经设置 UI 指定」。
-- **同步项（会诊 O10）**：host 测试 :1038（创建断言补 coordinator 行）、:1053-1056（U4 改用手写空缺 fixture 表达「空缺→全拒」语义）、:1872（rotation 创建流）；README:390 changelog 补一句；§3.3.2 补 bootstrap 规则行。`writerGate` / `retireGate` **一行不动**（U4 语义保留：手写空缺行仍然全拒并指向设置 UI）。
+- **同步项（会诊 O10）**：host 测试 :1038（创建断言补 coordinator 行）、:1053-1056（U4 改用手写空缺 fixture 表达「空缺→全拒」语义）、:1872（rotation 创建流）——**事后核实**：:1872 实测为 no-op（该处 upsert-team 打在既有团队上且现任已置位，既不走创建路径也不读该字段，审计 F5），故实际需同步的是前两处（各含新增断言）。README:390 changelog 补一句；§3.3.2 补 bootstrap 规则行。`writerGate` / `retireGate` **一行不动**（U4 语义保留：手写空缺行仍然全拒并指向设置 UI）。
 - **不新增 schema 字段**（`roles`/`history` 结构不变，settings 往返不丢字段的既有断言继续成立）。
 - **与 §3.3.2 写权限模型的自洽性**：自举只发生在**创建**这一次、且只把创建者写成现任；创建者此后确实是现任，故与「写操作需现任身份」不冲突，也未新增除用户之外的第二条越权通道。
 

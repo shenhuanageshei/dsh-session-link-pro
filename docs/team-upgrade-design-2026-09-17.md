@@ -484,7 +484,7 @@ sequenceDiagram
 - fan-out 不绕门、rotation 迁移不出团队域、provisional 必带 TTL；
 - 所有新增模型可见输出过 wellFormed 门槛（沿用 textOutput 约定）；
 - goals 服务缺失时插件功能完整降级（仅 goal 信号显示 ?）；
-- **服务获取不得静默失效**（§9.1.3 / §9.3）：settings 未能立刻挂载时必须留一行 warn，挂载成功留一行 info——不得存在任何第二次静默回退。
+- **服务获取不得静默失效**（§9.1.3 / §9.3）：settings 未能立刻挂载时必须留一行 warn，挂载成功留一行 info——不得存在任何第二次静默回退。**粒度是「每个未挂载窗口」**：store 可因 provider 生命周期结束（`detach`）而重新进入未挂载态，此时告警门随窗口复位——否则第二个窗口里的**拒绝**会零告警，与 ③ 的原始缺陷同形。
 
 ---
 
@@ -621,7 +621,8 @@ function createPolicyStore(ctx) {
 	// ③ 惰性兜底：get()/update() 每次调用时若 scope === null 再试一次 ctx.get("settings")；
 	//    成功即挂载并记 info；仍失败**不重复告警**——注意「未挂载告警」有**两条到达路径**
 	//    （激活时未 active、以及 active 但 register 抛错），二者共用同一个 attachWarned 门，
-	//    否则惰性重试会把 warn 变成无上界告警风暴（U11 的「有且仅有一行」按**整个启动窗口**计）
+	//    否则惰性重试会把 warn 变成无上界告警风暴（U11 的「有且仅有一行」按**每个未挂载窗口**计；
+	//    窗口边界 = detach，见下「留痕」与「生命周期归属」两条）
 
 	return { get, update, migrateLegacyPolicy };
 }
@@ -632,7 +633,9 @@ function createPolicyStore(ctx) {
 - **确定性**：`ctx.inject(["settings"], cb)` 的回调只在服务 active 后运行（cordis 的注入等待语义），时序竞态被结构性消除；同时它不是硬依赖——服务永缺时插件照常加载并降级。
 - **保留快路**：同步提供方（含测试 stub）走 ①，不引入任何异步延迟，既有测试语义不变。
 - **数据一致性**：内存引擎只可能在「启动窗口」内被写入，而此刻尚无活动代理能调用工具；挂载时以 settings 为事实源，若内存期确有非默认值则按与 legacy 迁移同形的规则（仅当 settings 为默认时）并入——该窗口理论不可达，此条作为防御性冗余记录。
-- **留痕**（防复发，红线级）：任何「未能立刻挂载」必须留一行 warn——**整个启动窗口合计恰一行**（「激活时未 active」与「active 但 register 抛错」两条到达路径共用同一一次性门，否则惰性重试会让 warn 无上界）；挂载成功留一行 info；旧命名空间 register 失败也留一行（best-effort ≠ 静默）。**不得再存在第二次静默回退。**
+- **留痕**（防复发，红线级）：任何「未能立刻挂载」必须留一行 warn——**每个未挂载窗口合计恰一行**（「激活时未 active」与「active 但 register 抛错」两条到达路径共用同一一次性门，否则惰性重试会让 warn 无上界）；**窗口的边界是 `detach`**——provider 的注入 fiber 被 dispose 时释放 scope 并**复位该门**，于是回归的 provider 若被拒绝（register 抛错）仍会如实告警（否则第二个窗口零告警＝静默拒绝，正是 ③ 的原形）；挂载成功留一行 info；旧命名空间 register 失败也留一行（best-effort ≠ 静默）。**不得再存在第二次静默回退。**
+- **生命周期归属（评审 round-2 🟡 落地）**：晚挂路径上 scope 的生命周期绑到**它自己的注入 fiber**（`owner.effect(() => () => detach())`），与 webServer 站点的 `target.effect(...)` **逐字同一规则**；provider 消失即 `detach`（两个 scope 归零 + 一行 info），store 回到未挂载态，由既有惰性重试在 provider 回归时重挂——**不再以死 scope 冒充已挂载**（那会让 `get()` 静默服务陈旧内存、而 `update()` 每次抛错，读写长期不一致）。**快路（宿主自身 ctx）无需额外处理**：那里的 owner 就是本插件自己的 fiber，store 与工具注册、巡逻 effect 同生共死，死 scope 在该路径上不可达；绑定仍登记，只为 §9.1.3 两个站点的 teardown 行为一致且显式。**已知残留（如实标注）**：provider 在本插件 fiber 存活期间消失、而 scope 取自本插件自身 ctx 时不释放（与 webServer 站点同形，不属本红线）。
+- **内存窗口旗标的语义**：`memoryDirty` 在链的**消耗路径**（已并入设置 / 因设置侧非默认而未并入）之后清零；**并入失败时保持置位**——那些写入确实仍在进程内存里，下一个窗口必须重试（清零会漏掉重试）。
 - **调用点迁移**：`migrateLegacyPolicy()` 由「apply 当场调用」改为「attach 之后调用」（apply 当场调用在 ③ 未修时恒为 no-op）。
 - **同类竞态的第三处（会诊 O6，本设计一并覆盖）**：`registerExportRoute`（lib/index.js:3909-3913）同样在 apply 期取 `ctx.get("webServer")` 时点快照；它已有 warn 与安全降级，但**同样受时序支配**——当前之所以导出路由可用，只是因为 webServer 的提供方恰好先于本插件 active（日志中**从未**出现 `:3912` 的 warn 即为此反证）。同一「晚挂 + 重试」模式覆盖：不可用时 `ctx.inject(["webServer"], child => registerExportRoute(child))`。
 - **已评估并否决的备选（会诊 O5）**：把 `"settings"` / `"webServer"` 直接加入 `inject` 数组。否决理由：`inject` 是**硬依赖**——依赖缺失时 cordis 令整个插件 fiber 不激活（`Fiber._refresh` → INACTIVE），本插件会连深链与导出工具一起消失，与 `:3912` 已声明的降级语义相抵；而 `ctx.inject` 与 `inject` 在**确定性**上等价（同样等待 provider 完成 `[Service.init]`，cordis/lib/index.js:1306）。**判决可逆**：若设计评审倾向 `inject`，回退为一行改动。

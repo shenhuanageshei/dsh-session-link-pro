@@ -60,13 +60,21 @@ function makeTargetAgent(status = "idle") {
  * `seed` pre-fills a namespace's data at register time (the state a provider
  * would have loaded from disk), which is how U9 gives the rename migration
  * something to migrate without hand-writing a settings file.
+ *
+ * `F1` (`settingsRegisterThrows`) models a provider that IS active but refuses
+ * `register` — the divergence-audit path where the store can never attach and
+ * every lazy retry re-enters the catch. `legacyRegisterThrows` keeps the current
+ * namespace working and refuses only `session-link-pro`, the one-line clause of
+ * 评审 #4 (an unavailable legacy namespace must say so).
  */
-function makeSettings(seed = {}) {
+function makeSettings(seed = {}, { settingsRegisterThrows = false, legacyRegisterThrows = false } = {}) {
 	const namespaces = new Map();
 	return {
 		namespaces,
 		service: {
 			register(namespace, _schema, options = {}) {
+				if (settingsRegisterThrows) throw new Error("register refused by stub");
+				if (legacyRegisterThrows && String(namespace) === "session-link-pro") throw new Error("legacy namespace refused by stub");
 				const state = { base: structuredClone(options.base ?? {}), data: structuredClone(seed[String(namespace)] ?? {}) };
 				namespaces.set(String(namespace), state);
 				return {
@@ -159,7 +167,7 @@ function makeQuery(sessions, eventsBySession = {}, surfaceReadHook) {
  * `ctx.inject` before `apply` to cover the documented "ctx.inject unavailable"
  * branch.
  */
-function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, lateSettings = false, lateWebServer = false, noInject = false, settingsSeed, selfCwd, omitUserQuestions = false, surfaceReadHook } = {}) {
+function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, lateSettings = false, lateWebServer = false, noInject = false, settingsSeed, settingsRegisterThrows = false, legacyRegisterThrows = false, selfCwd, omitUserQuestions = false, surfaceReadHook } = {}) {
 	const ctx = new Context();
 	// Every plugin log line lands in `log.lines` instead of the console: the
 	// service-attach red line (§5.3) is asserted on the lines themselves.
@@ -222,7 +230,7 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 		roots() { return [senderAgent, targetAgent, runnerAgent, ...extraAgentObjects.filter((agent) => agent.session?.header?.origin !== "subagent")]; },
 	};
 	const uq = makeUserQuestions(askScript);
-	const settings = useSettings || lateSettings ? makeSettings(settingsSeed) : undefined;
+	const settings = useSettings || lateSettings ? makeSettings(settingsSeed, { settingsRegisterThrows, legacyRegisterThrows }) : undefined;
 	ctx.provide("sessionReferenceResolver", resolver);
 	ctx.provide("tools", { register(tool) { registeredTools.push(tool); return () => {}; } });
 	const query = makeQuery(sessions, eventsBySession, surfaceReadHook);
@@ -518,6 +526,25 @@ check("json keeps full event log", json.eventCount === 4 && Array.isArray(json.e
 check("json marks exporter", json.exporter === "dsh-team-link");
 const exportMissing = await exportTool.execute({ sessionId: "session-nope", outputDir: tmpDir }, execFor(exportEnv.senderAgent));
 check("export of unknown session reports failure", exportMissing.includes("导出失败"));
+
+// 评审 #2: the artifact name is a path, so the session id has to pass the SAME
+// filename-safety invariant the download route already applied. A traversal-shaped
+// id is the sharp case: before the shared helper it decided both the directory the
+// write went to and its extension. The events lookup stays on the raw id — only the
+// name is sanitised, so the artifacts keep their `<id>-<timestamp>` readability.
+const escEvents = [{ type: "user/message", seq: 1, time: 1, data: { id: "e1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "越界会话" }] } }];
+const escEnv = setup({ sessions: [{ header: { id: "../../escaped", createdAt: 1000, cwd: CWD }, live: true, persisted: true }], eventsBySession: { "../../escaped": escEvents } });
+const escDir = path.resolve(".test-tmp-escape");
+rmSync(escDir, { recursive: true, force: true });
+const escOut = await escEnv.tool("team_link_export").execute({ sessionId: "../../escaped", outputDir: escDir }, execFor(escEnv.senderAgent));
+const escFiles = escOut.split("\n").map((line) => line.replace("- ", "").trim()).filter((line) => line.endsWith(".md") || line.endsWith(".json"));
+check("评审 #2: the export tool and the download route share one filename invariant — a traversal-shaped id is written inside the export dir under the sanitised name", escFiles.length === 2 && escFiles.every((file) => path.dirname(path.resolve(file)) === escDir && /^\.\._\.\._escaped-\d{8}-\d{6}\.(md|json)$/u.test(path.basename(file))) && !existsSync(path.resolve(escDir, "..", "escaped-")));
+
+const routeEnv = setup({ sessions: [{ header: { id: "../../escaped", createdAt: 1000, cwd: CWD }, live: true, persisted: true }], eventsBySession: { "../../escaped": escEvents } });
+const exportRoute = routeEnv.routes.find((route) => route.path === "/team-link/export");
+let routeResult;
+await exportRoute.handler({ url: "/team-link/export?session=../../escaped&format=md" }, { writeHead(code, headers) { routeResult = { code, headers }; }, end() {} });
+check("评审 #2: the download header uses the same invariant (no separator can reach content-disposition)", routeResult.code === 200 && routeResult.headers["content-disposition"] === 'attachment; filename=".._.._escaped.md"');
 
 // ---------------------------------------------------------------------------
 // -pro: send tool — approve → accept → wake (idle target)
@@ -2228,8 +2255,49 @@ const lazyOut = await lazyEnv.tool("team_link_roster").execute({ action: "upsert
 check("U11: the first tool call retries lazily and attaches (§9.1.3 ③) — the write lands in settings and one info line is left", lazyOut.includes("已创建团队 night-shift") && (lazyEnv.settings.namespaces.get("team-link")?.data.teams ?? []).length === 1 && lazyEnv.log.lines.info.filter((line) => line.includes("policy store attached")).length === 1);
 check("U11: ... and the retry did not repeat the activation warn (still exactly two lines: the window and the missing ctx.inject)", lazyEnv.log.lines.warn.length === 2);
 
+// --- F1 (差异审计 · 唯一实质分歧): a provider that is ACTIVE but refuses ----
+// `register` is the second arrival path of the same "not attached" warn. When
+// the provider is already active, attachFrom() reports "attached" on every call,
+// so the activation branch below never runs and — pre-fix — nothing latched a
+// one-shot gate: each get()/update() re-entered the register catch and the warn
+// had no upper bound (audit probe: 3 get + 1 upsert ⇒ 11 warns). §9.1.3 ③ puts
+// both paths behind the same `attachWarned` gate, counted over the whole startup
+// window (U11). The assertions below count only this plugin's settings lines, so
+// the webServer warn of an unrelated branch cannot mask a missing gate.
+const settingsWarnsOf = (lines) => lines.filter((line) => line.includes("dsh-team-link: settings "));
+
+// This fixture is the audit's own shape: the provider IS active when the plugin
+// activates (so the fast path reaches `attach` and the refusal is the first thing
+// the store ever sees), while the assertions after it drive the lazy retries.
+const refusingEnv = setup({ sessions: [], useSettings: true, settingsRegisterThrows: true, selfCwd: TEAM_WS });
+check("F1 前置: the refusal is announced once when the active provider refuses register", settingsWarnsOf(refusingEnv.log.lines.warn).length === 1 && settingsWarnsOf(refusingEnv.log.lines.warn)[0].includes("settings register failed") && refusingEnv.log.lines.info.length === 0);
+const refusingRoster = refusingEnv.tool("team_link_roster");
+const refusingOut = await refusingRoster.execute({ action: "upsert-team", team: "night-shift" }, execFor(refusingEnv.senderAgent));
+check("F1 前置: with no scope attached the store stays usable on the memory engine", refusingOut.includes("已创建团队 night-shift") && refusingEnv.settings.namespaces.size === 0);
+check("F1: after three lazy get() retries and one update(), the whole startup window still carries exactly one settings warn — no warn storm", refusingOut.includes("已创建团队 night-shift") && settingsWarnsOf(refusingEnv.log.lines.warn).length === 1 && refusingEnv.log.lines.info.length === 0);
+
+// The mirror image, so the gate is asserted on BOTH arrival paths: here the
+// provider only becomes active after apply, so the activation branch writes the
+// line first and the lazy retries must stay quiet behind the same gate.
+const lateRefusingEnv = setup({ sessions: [], lateSettings: true, settingsRegisterThrows: true, selfCwd: TEAM_WS });
+check("F1 对照: the activation warn is the only line before the provider goes active", settingsWarnsOf(lateRefusingEnv.log.lines.warn).length === 1 && lateRefusingEnv.log.lines.warn[0].includes("settings not active at activation"));
+await lateRefusingEnv.provideSettings();
+const lateRefusingRoster = lateRefusingEnv.tool("team_link_roster");
+const lateRefusingOut = await lateRefusingRoster.execute({ action: "upsert-team", team: "night-shift" }, execFor(lateRefusingEnv.senderAgent));
+check("F1 对照: the register failure that arrives second does NOT add a line — same gate, one line for the window", lateRefusingOut.includes("已创建团队 night-shift") && settingsWarnsOf(lateRefusingEnv.log.lines.warn).length === 1 && lateRefusingEnv.log.lines.info.length === 0);
+
+// --- 评审 #4: an unavailable LEGACY namespace must not be swallowed ----------
+// The pre-rename namespace is best-effort, but "best-effort" ≠ silent: if it
+// cannot be registered, the pre-rename trust data will not be migrated, and that
+// has to be visible. Only `session-link-pro` is refused here, so the current
+// namespace still attaches normally.
+const legacyEnv = setup({ sessions: [], useSettings: true, legacyRegisterThrows: true, selfCwd: TEAM_WS });
+check("评审 #4: the current namespace still attaches while the legacy one is refused", legacyEnv.settings.namespaces.has("team-link") && !legacyEnv.settings.namespaces.has("session-link-pro") && legacyEnv.log.lines.info.filter((line) => line.includes("policy store attached")).length === 1);
+check("评审 #4: ... and the unavailable legacy namespace leaves one line naming it and the skipped migration", legacyEnv.log.lines.warn.length === 1 && legacyEnv.log.lines.warn[0].includes(`legacy namespace "session-link-pro" unavailable`) && legacyEnv.log.lines.warn[0].includes("不会自动迁移"));
+
 // cleanup
 rmSync(tmpDir, { recursive: true, force: true });
+rmSync(escDir, { recursive: true, force: true });
 rmSync(TEAM_TMP, { recursive: true, force: true });
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);

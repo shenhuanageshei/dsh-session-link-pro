@@ -148,7 +148,9 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 	const runnerAgent = { id: "session-runner", status: "running", session: { header: { id: "session-runner", cwd: CWD } } };
 	// Extra agents are full message sinks (same shape as the target stub) so a
 	// fan-out can be asserted target by target; `extraCalls` records what each
-	// one received.
+	// one received. `cwd` and `origin` default to the historic stub shape; a
+	// fixture can place a peer in another workspace or shape it as a subagent,
+	// which is what the no-agent hint list filters on.
 	const extraCalls = new Map();
 	const extraAgentObjects = extraAgents.map((entry) => {
 		const calls = { injected: [], steered: [], followedup: [] };
@@ -156,7 +158,7 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 		return {
 			id: entry.id,
 			status: entry.status,
-			session: { header: { id: entry.id, cwd: CWD } },
+			session: { header: { id: entry.id, cwd: entry.cwd ?? CWD, ...(entry.origin === undefined ? {} : { origin: entry.origin }) } },
 			inject(message) { calls.injected.push(message); },
 			steer(message) { calls.steered.push(message); },
 			followup(message) { calls.followedup.push(message); },
@@ -173,7 +175,14 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 			if (id === runnerAgent.id) return runnerAgent;
 			return extraAgentObjects.find((candidate) => candidate.id === id);
 		},
-		roots() { return [senderAgent, targetAgent, runnerAgent, ...extraAgentObjects]; },
+		/** Every live agent, in registration order — the registry face the
+		 * no-agent refusal's hint list reads. A `hidden` id is a closed session:
+		 * the fixture keeps its registration, so list() must not advertise it. */
+		list() { return [senderAgent, targetAgent, runnerAgent, ...extraAgentObjects].filter((agent) => !hidden.has(agent.id)); },
+		/** Live top-level agents. A subagent is created under an owning agent, so it
+		 * is never a root — the hint list and the delivery guard share both this
+		 * membership and the coarse `origin` class. */
+		roots() { return [senderAgent, targetAgent, runnerAgent, ...extraAgentObjects.filter((agent) => agent.session?.header?.origin !== "subagent")]; },
 	};
 	const uq = makeUserQuestions(askScript);
 	const settings = useSettings ? makeSettings() : undefined;
@@ -535,6 +544,48 @@ const selfOut = await guardEnv.tool("team_link_send").execute({ targetSessionId:
 check("self-send refused", selfOut.includes("不能是当前会话"));
 const deadOut = await guardEnv.tool("team_link_send").execute({ targetSessionId: "session-cold", message: "喂" }, execFor(guardEnv.senderAgent));
 check("dead target refused", deadOut.includes("没有活动代理"));
+
+// ---------------------------------------------------------------------------
+// no-agent refusal, self-healing (生产事故：目标 id 转录错位一位 →
+// 「目标会话 … 没有活动代理」只给了一种解释，调用方无从核对 id，于是把失败
+// 当成功继续汇报，而目标会话其实活着)
+// ---------------------------------------------------------------------------
+// Deliverable shape: ❌ lead + the legacy sentence + the live sessions of the
+// caller's OWN workspace + the recovery hint. The list is a registry read only
+// (no surface read), which is why a refusal path can afford it.
+
+/** The hint fixture: two live root peers in the CALLER's workspace, one root in
+ * another workspace, one subagent. `session-target` / `session-runner` are the
+ * always-present roots in CWD — outside this caller's workspace, so they must
+ * not be advertised either. */
+const hintEnv = setup({
+	sessions: [],
+	selfCwd: `${CWD}/ws`,
+	extraAgents: [
+		{ id: "session-peer-a", status: "running", cwd: `${CWD}/ws` },
+		{ id: "session-peer-b", status: "idle", cwd: `${CWD}/ws` },
+		{ id: "session-elsewhere", status: "idle", cwd: "D:/elsewhere" },
+		{ id: "session-child", status: "idle", cwd: `${CWD}/ws`, origin: "subagent" },
+	],
+});
+const hintOut = await hintEnv.tool("team_link_send").execute({ targetSessionId: "session-typo", message: "喂" }, execFor(hintEnv.senderAgent));
+check("no-agent: the refusal leads with ❌ 未投递 — a failure may never be read as a queued send", hintOut.startsWith("❌ 未投递：目标会话 session-typo 没有活动代理"));
+check("no-agent: the legacy sentence stays word for word", hintOut.includes("（未在本壳中打开或已退出）。仅支持投递到存活会话。"));
+check("no-agent: it lists the caller's own workspace, one live session per line with its state", hintOut.includes("当前工作区其他存活会话（共 2 个）：") && hintOut.includes("\n  - session-peer-a（运行中）") && hintOut.includes("\n  - session-peer-b（空闲）"));
+check("no-agent: ...and only those — another workspace, a subagent, the caller and the other roots stay out", !hintOut.includes("session-elsewhere") && !hintOut.includes("session-child") && !hintOut.includes("session-self") && !hintOut.includes("session-target") && !hintOut.includes("session-runner"));
+check("no-agent: the recovery hint names the id check, the sidebar re-open and list_sessions", hintOut.includes("请对照上列 id 核对目标 id（常见错误：转录错位）") && hintOut.includes("在侧边栏打开目标会话一次使其恢复为活动代理") && hintOut.includes("team_link_list_sessions"));
+
+const hintCapEnv = setup({
+	sessions: [],
+	selfCwd: `${CWD}/ws`,
+	extraAgents: Array.from({ length: 12 }, (_, index) => ({ id: `session-peer-${index}`, status: index === 0 ? "running" : "idle", cwd: `${CWD}/ws` })),
+});
+const hintCapOut = await hintCapEnv.tool("team_link_send").execute({ targetSessionId: "session-typo", message: "喂" }, execFor(hintCapEnv.senderAgent));
+check("no-agent: the hint list stops at 10 and declares the bound instead of hiding it", hintCapOut.includes("当前工作区其他存活会话（共 12 个，仅列前 10 个）：") && (hintCapOut.match(/\n  - session-peer-/gu) ?? []).length === 10);
+
+const hintSoloEnv = setup({ sessions: [], selfCwd: `${CWD}/solo` });
+const hintSoloOut = await hintSoloEnv.tool("team_link_send").execute({ targetSessionId: "session-typo", message: "喂" }, execFor(hintSoloEnv.senderAgent));
+check("no-agent: with no other live session in the workspace the list degrades to one honest sentence", hintSoloOut.startsWith("❌ 未投递") && hintSoloOut.includes("当前工作区无其他存活会话。") && !hintSoloOut.includes("当前工作区其他存活会话"));
 
 // ---------------------------------------------------------------------------
 // -pro: lone-surrogate safety (code-point truncation + well-formed output)
@@ -1338,7 +1389,20 @@ check("U5: the blocked broadcast reports zero deliveries", blockOut.includes("�
 
 const deadFanEnv = fanEnv();
 const deadFanOut = await deadFanEnv.send.execute({ targets: ["session-nope"], message: "喂" }, execFor(deadFanEnv.senderAgent));
-check("U5: a target with no live agent is its own row and its own summary bucket", deadFanOut.includes("- session-nope → no-agent：发送失败：目标会话 session-nope 没有活动代理") && deadFanOut.includes("汇总：0 投递 / 0 拒绝 / 1 无活动代理。"));
+check("U5: a target with no live agent is its own row and its own summary bucket", deadFanOut.includes("- session-nope → no-agent：❌ 未投递：目标会话 session-nope 没有活动代理") && deadFanOut.includes("汇总：0 投递 / 0 拒绝 / 1 无活动代理。"));
+check("U5: the no-agent row is the same self-healing refusal as the single-target one (this caller's workspace holds no other live session)", deadFanOut.includes("当前工作区无其他存活会话。") && deadFanOut.includes("请对照上列 id 核对目标 id（常见错误：转录错位）"));
+
+// --- 生产事故：把「1 投递 / 2 拒绝」读成「已广播」 --------------------------
+// A batch that lost a target OPENS with a ❌ lead, so its report can never be
+// skimmed as the report of a batch that reached everyone; a batch that reached
+// everyone keeps its historic shape exactly (header / rows / summary).
+const firstLine = (text) => String(text).split("\n")[0];
+check("fan-out 失败领先: the all-delivered report keeps its historic first line and gains no ❌", firstLine(fanOut) === "广播 fan-out：2 个目标" && !fanOut.includes("❌") && !fanOut.includes("个目标未投递"));
+check("fan-out 失败领先: one delivery + one refusal leads with 1 未投递 / 1 已投递", firstLine(mixOut) === "❌ 1 个目标未投递（1 个已投递）");
+check("fan-out 失败领先: a fully refused batch leads with 2 未投递 / 0 已投递", firstLine(closedOut) === "❌ 2 个目标未投递（0 个已投递）");
+check("fan-out 失败领先: a dead target leads with 1 未投递 / 0 已投递", firstLine(deadFanOut) === "❌ 1 个目标未投递（0 个已投递）");
+check("fan-out 失败领先: the per-target rows and the original summary still follow the lead", mixOut.includes("\n广播 fan-out：2 个目标\n") && mixOut.trimEnd().endsWith("汇总：1 投递 / 1 拒绝。"));
+check("fan-out 失败领先: a no-holder target counts as 未投递 in the lead (the message did not reach it) while the summary keeps its own bucket", firstLine(holderOut) === "❌ 2 个目标未投递（0 个已投递）" && holderOut.includes("汇总：0 投递 / 0 拒绝 / 2 空缺目标（no-holder，不计入投递与失败）。"));
 
 const nineEnv = fanEnv();
 const nineOut = await nineEnv.send.execute({ targets: Array.from({ length: 9 }, (_, index) => `session-x${index}`), message: "x" }, execFor(nineEnv.senderAgent));
@@ -1533,6 +1597,25 @@ const rotGet = await rotA.roster.execute({ action: "get", team: "night-shift" },
 check("M4 令牌掩码: the roster.md mirror renders only the masked token (M2 评审 #3)", rotMirror.includes(`tok-${rotToken.slice(0, 4)}…${rotToken.slice(-4)}`) && !rotMirror.includes(rotToken));
 check("M4 令牌掩码: roster get renders only the masked token too, and names the binding", rotGet.includes("掩码") && rotGet.includes(`tok-${rotToken.slice(0, 4)}…${rotToken.slice(-4)}`) && rotGet.includes("绑定 team=night-shift role=coordinator") && !rotGet.includes(rotToken));
 check("M4 令牌掩码: the plaintext token exists exactly once — in the prepare result", rotPrep.includes(rotToken) && !rotMirror.includes(rotToken) && !rotGet.includes(rotToken));
+
+// --- the third no-agent path: a plugin notice (§3.6.2 internal broadcast) -----
+// The notice path builds its sender from an id alone, so there is no session
+// identity and therefore no workspace to filter by: the refusal lists the live
+// sessions it can see and excludes the caller — that is all it can honestly do.
+// (Placed after the mirror assertions above: this prepare writes the same
+// `roster.md` mirror and would otherwise re-render it under another token.)
+const rotHintEnv = rotateEnv({
+	teams: [{
+		name: "night-shift",
+		createdAt: 1_700_000_000_000,
+		workspace: TEAM_WS,
+		policy: { writer: "coordinator" },
+		roles: [...rotRoles(), { role: "worker-c", current: "session-gone", pending: null, history: [{ session: "session-gone", from: 1_700_000_000_000, until: null }] }],
+	}],
+});
+const rotHintPrep = await rotHintEnv.rotate.execute({ action: "prepare", team: "night-shift", role: "coordinator", successor: SUCCESSOR }, execFor(rotHintEnv.senderAgent));
+check("no-agent: a notice to a member with no live agent carries the same ❌ 未投递 refusal", rotHintPrep.includes("  - session-gone → no-agent：❌ 未投递：目标会话 session-gone 没有活动代理"));
+check("no-agent: with no session identity in the notice path the hint list skips the workspace filter (only the caller is excluded)", rotHintPrep.includes("当前工作区其他存活会话") && rotHintPrep.includes("session-target（空闲）") && !rotHintPrep.includes("session-gone（"));
 
 // --- claim (Phase B): the single dialog, domain-limited migration -----------
 

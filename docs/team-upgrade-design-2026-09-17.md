@@ -718,6 +718,7 @@ function createPolicyStore(ctx) {
 | ⑧ | 2 个 🔵（断言总数自校验、provisional 计数口径） | **并入本轮测试补强阶段**：`host-half.test.mjs` 结尾输出断言总数（供 README 计数自校验）；`list_sessions` 的 provisional 计数措辞对齐。验收 = U8 复跑中可见该输出与措辞 | §9.1.5 / U8 |
 | ⑨ | dsh-schedule overlay 默认启用 | **已定档**：本 profile 未挂载（无 mount 行、不在 bundles、不在 dsh-base 依赖）→ 引导文案不假设其可用；是否启用仍属用户配置决定（本轮不改 profile） | §7-3 |
 | ⑩ | §7-1 V9 / §7-2 tick source 校验 / §7-4 夜班取证 | §7-1 **API 面已验证**（agents.create/createAgent 存在且插件已注入 agents；全自动升级显式推迟）；§7-2 **契约层已验**（迁移校验器源码逐条比对），端到端待真实 tick；§7-4 原样保留 | §7 显式不阻塞 |
+| ⑪ | 评审 round-4 的两个 🔵：store 返回对象中的死导出 `migrateLegacyPolicy`；webServer 站点的一次性 warn 门是**进程寿命级**（与 settings 站点刚修掉的「门不随窗口复位」同形） | **显式推迟**（记录在案，非静默）。两者均为卫生/一致性项，评审自身判「无阻塞」：⑪-a 无外部消费者，删除只为整洁；⑪-b 的影响面窄——webServer 站点**没有工具调用可重试**，README:368 已声明其重试故事，仅「重挂后又失败」这一窗口受影响。若后续要与 settings 站点完全对称，按评审建议在注入回调 mount 失败后按窗口复位该门 | 本节留档 |
 
 ### 9.7 会诊 #36 意见处置
 

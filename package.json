@@ -1,6 +1,6 @@
 {
   "name": "dsh-team-link",
-  "version": "0.3.0",
+  "version": "0.3.7",
   "description": "Session deep links + full session export + approved cross-session messaging + team identity/lifecycle (roster, watchdog, broadcast, rotation) for DeepSeek Harness (dsh). Formerly dsh-session-link-pro.",
   "type": "module",
   "main": "lib/index.js",

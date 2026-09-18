@@ -11,7 +11,11 @@ import path from "node:path";
 import { apply, __testing } from "./lib/index.js";
 
 let failures = 0;
+/** Assertions executed in this run, printed at the end so the README figure is
+ * checkable against the run instead of remembered (§9.6 ⑧). */
+let assertions = 0;
 function check(label, cond) {
+	assertions += 1;
 	console.log(`${cond ? "PASS" : "FAIL"}  ${label}`);
 	if (!cond) failures += 1;
 }
@@ -53,14 +57,17 @@ function makeTargetAgent(status = "idle") {
  * `register` returns the same `get()`/`update(patch)` scope shape the real
  * `settings` service does, so the policy store (and the watchdog list it now
  * carries) is exercised through its real settings path, not the memory fallback.
+ * `seed` pre-fills a namespace's data at register time (the state a provider
+ * would have loaded from disk), which is how U9 gives the rename migration
+ * something to migrate without hand-writing a settings file.
  */
-function makeSettings() {
+function makeSettings(seed = {}) {
 	const namespaces = new Map();
 	return {
 		namespaces,
 		service: {
 			register(namespace, _schema, options = {}) {
-				const state = { base: structuredClone(options.base ?? {}), data: {} };
+				const state = { base: structuredClone(options.base ?? {}), data: structuredClone(seed[String(namespace)] ?? {}) };
 				namespaces.set(String(namespace), state);
 				return {
 					get() { return { ...structuredClone(state.base), ...structuredClone(state.data) }; },
@@ -97,6 +104,19 @@ function makeUserQuestions(script) {
 }
 
 /**
+ * Capturing stand-in for cordis' LoggerService. §5.3 红线 is "a service that
+ * fails to attach must leave a line", so the assertions need the lines
+ * themselves rather than a console. Callable like the real `ctx.logger()`, so an
+ * internal cordis `ctx.logger(...)` call cannot trip over the stub.
+ */
+function makeLogger() {
+	const lines = { warn: [], info: [], error: [] };
+	const logger = () => logger;
+	for (const level of ["warn", "info", "error"]) logger[level] = (message) => { lines[level].push(String(message)); };
+	return { lines, service: logger };
+}
+
+/**
  * @param surfaceReadHook - optional probe run at the START of every surface
  * read. The list tool's read window (§3.1: bounded to PREVIEW_SESSIONS, and
  * parallel) is asserted through it: a read sequenced behind the previous one
@@ -126,9 +146,26 @@ function makeQuery(sessions, eventsBySession = {}, surfaceReadHook) {
 	return query;
 }
 
-/** Build a full plugin environment on a fresh cordis Context. */
-function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, selfCwd, omitUserQuestions = false, surfaceReadHook } = {}) {
+/**
+ * Build a full plugin environment on a fresh cordis Context.
+ *
+ * `lateSettings` exists for U9 (§9.1.3/§9.1.4): the settings stub is created but
+ * NOT provided before `apply`, so the run reproduces the production order
+ * (plugin activates first, the settings provider finishes its `[Service.init]`
+ * later). `provideSettings()` then does what the provider does once it is
+ * active — `ctx.provide`, which is what fires the plugin's
+ * `ctx.inject(["settings"], …)` callback. `lateWebServer` is the same fixture
+ * for the second site of that race (the export route), and `noInject` drops
+ * `ctx.inject` before `apply` to cover the documented "ctx.inject unavailable"
+ * branch.
+ */
+function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, lateSettings = false, lateWebServer = false, noInject = false, settingsSeed, selfCwd, omitUserQuestions = false, surfaceReadHook } = {}) {
 	const ctx = new Context();
+	// Every plugin log line lands in `log.lines` instead of the console: the
+	// service-attach red line (§5.3) is asserted on the lines themselves.
+	const log = makeLogger();
+	ctx.logger = log.service;
+	if (noInject) ctx.inject = undefined;
 	const prepared = [];
 	let failWith = null;
 	const resolver = {
@@ -185,7 +222,7 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 		roots() { return [senderAgent, targetAgent, runnerAgent, ...extraAgentObjects.filter((agent) => agent.session?.header?.origin !== "subagent")]; },
 	};
 	const uq = makeUserQuestions(askScript);
-	const settings = useSettings ? makeSettings() : undefined;
+	const settings = useSettings || lateSettings ? makeSettings(settingsSeed) : undefined;
 	ctx.provide("sessionReferenceResolver", resolver);
 	ctx.provide("tools", { register(tool) { registeredTools.push(tool); return () => {}; } });
 	const query = makeQuery(sessions, eventsBySession, surfaceReadHook);
@@ -194,14 +231,27 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 	// `omitUserQuestions` models a shell without the confirmation service (the
 	// M2 retirement cleanup and the M1 send gates must both degrade, not crash).
 	if (!omitUserQuestions) ctx.provide("userQuestions", uq.service);
-	ctx.provide("webServer", { register(route) { routes.push(route); return () => {}; } });
-	if (settings !== undefined) ctx.provide("settings", settings.service);
+	// `lateWebServer` models the second site of the same race (§9.1.3): the
+	// header export route is taken from the runtime channel too.
+	const webServerService = { register(route) { routes.push(route); return () => {}; } };
+	if (!lateWebServer) ctx.provide("webServer", webServerService);
+	if (settings !== undefined && !lateSettings) ctx.provide("settings", settings.service);
 	// The `goals` service is optional by design (§3.1): absent here means the
 	// degraded path, present means a goal view (or `undefined` for "no goal").
 	if (goals !== undefined) ctx.provide("goals", { get(agent) { return goals[agent.id]; } });
 	apply(ctx);
 	const tool = (name) => registeredTools.find((candidate) => candidate.name === name);
-	return { ctx, prepared, setFailWith: (error) => { failWith = error; }, setHiddenAgent: (id, value) => { if (value) hidden.add(id); else hidden.delete(id); }, registeredTools, routes, senderAgent, senderCalls, targetAgent, targetCalls, uq, tool, settings, query, agentFor: (id) => agents.get(id), extraCalls };
+	/** U9 handle: the settings provider going active AFTER the plugin loaded. */
+	const provideSettings = async () => {
+		ctx.provide("settings", settings.service);
+		await new Promise((resolve) => { setTimeout(resolve, 0); });
+	};
+	/** Same handle for the webServer provider (the export route's race). */
+	const provideWebServer = async () => {
+		ctx.provide("webServer", webServerService);
+		await new Promise((resolve) => { setTimeout(resolve, 0); });
+	};
+	return { ctx, prepared, setFailWith: (error) => { failWith = error; }, setHiddenAgent: (id, value) => { if (value) hidden.add(id); else hidden.delete(id); }, registeredTools, routes, senderAgent, senderCalls, targetAgent, targetCalls, uq, tool, settings, log, query, provideSettings, provideWebServer, agentFor: (id) => agents.get(id), extraCalls };
 }
 
 function execFor(agent) {
@@ -988,9 +1038,11 @@ const TEAM_TMP = path.resolve(".test-tmp-team");
 const TEAM_WS = path.join(TEAM_TMP, "ws");
 rmSync(TEAM_TMP, { recursive: true, force: true });
 
-/** One roster row as the user would write it in the settings UI — the only path
- * that can seat a team's first coordinator, because a vacant coordinator refuses
- * every session-side write (§3.3.2). */
+/** One roster row as the user would write it in the settings UI — a path that can
+ * seat a team's first coordinator by hand, and the one that can leave the role
+ * vacant (a vacant coordinator refuses every session-side write, §3.3.2). A team
+ * created through the tool no longer starts vacant: the creation path seeds the
+ * caller (§9.2.2 创建即认领). */
 function teamRow({ name = "night-shift", writer = "coordinator", current = "session-self", workspace = TEAM_WS, roles } = {}) {
 	return {
 		name,
@@ -1036,6 +1088,14 @@ check("roster get on an empty registry says so instead of failing", listEmpty.in
 
 const createOut = await createRoster.execute({ action: "upsert-team", team: "night-shift" }, execFor(createEnv.senderAgent));
 check("upsert-team creates the team with the default writer policy and the caller's workspace (§3.3.1)", createOut.includes("已创建团队 night-shift") && createOut.includes("policy.writer=coordinator") && teamStore(createEnv).length === 1 && teamStore(createEnv)[0].workspace === TEAM_WS && teamStore(createEnv)[0].createdAt > 0);
+check("§9.2.2 创建即认领: the creating session is seeded as the coordinator incumbent in the SAME write (canonical role shape, open tenure noted 创建者自举)", (() => {
+	const created = teamStore(createEnv)[0];
+	const entry = created.roles.find((candidate) => candidate.role === "coordinator");
+	return created.roles.length === 1 && entry !== undefined && entry.current === "session-self" && entry.pending === null
+		&& entry.history.length === 1 && entry.history[0].session === "session-self" && entry.history[0].until === null
+		&& entry.history[0].note === "创建者自举" && entry.history[0].from === created.createdAt;
+})());
+check("§9.2.2 创建即认领: the return text says who claimed the role and no longer points the first coordinator at the settings UI", createOut.includes("coordinator 已由创建会话 session-self 认领") && !createOut.includes("首任协调者需由用户经设置 UI 指定"));
 const mirrorFile = path.join(TEAM_WS, "team", "night-shift", "roster.md");
 check("the roster mirror is written in the same call (§3.3.1 人可读镜像)", existsSync(mirrorFile));
 const mirrorText = await readFile(mirrorFile, "utf8");
@@ -1050,10 +1110,17 @@ check("the name charset is lowercase-only as specified", upperName.includes("非
 const noAgentCreate = await createRoster.execute({ action: "upsert-team", team: "day-shift" }, { signal: new AbortController().signal });
 check("upsert-team without a live agent is refused — the workspace must come from a real agentCwd", noAgentCreate.includes("需要可交互的活动代理") && teamStore(createEnv).length === 1);
 
-const vacantSetRole = await createRoster.execute({ action: "set-role", team: "night-shift", role: "coordinator", session: "session-self" }, execFor(createEnv.senderAgent));
-check("U4: set-role is refused for every session while coordinator.current is null — the settings UI is the writable path", vacantSetRole.includes("当前空缺") && vacantSetRole.includes("设置 UI") && teamStore(createEnv)[0].roles.length === 0);
-const vacantUpsert = await createRoster.execute({ action: "upsert-team", team: "night-shift" }, execFor(createEnv.senderAgent));
-check("U4: an existing team answers upsert-team with the same writer gate", vacantUpsert.includes("当前空缺") && teamStore(createEnv).length === 1);
+// §9.2.2 同步项: the U4 「空缺 → 全拒」 semantics is expressed by a HAND-WRITTEN
+// vacant row (what the settings UI produces). A tool-created team can no longer
+// reach that state, so the old fixture (create a team, then write to it) would
+// now assert the opposite of what it was written for.
+const vacantEnv = teamEnv({ teams: [teamRow({ current: null })] });
+const vacantRoster = vacantEnv.tool("team_link_roster");
+const vacantSetRole = await vacantRoster.execute({ action: "set-role", team: "night-shift", role: "coordinator", session: "session-self" }, execFor(vacantEnv.senderAgent));
+check("U4: set-role is refused for every session while coordinator.current is null — the settings UI is the writable path", vacantSetRole.includes("当前空缺") && vacantSetRole.includes("设置 UI") && teamStore(vacantEnv)[0].roles[0].current === null);
+const vacantUpsert = await vacantRoster.execute({ action: "upsert-team", team: "night-shift" }, execFor(vacantEnv.senderAgent));
+check("U4: an existing team answers upsert-team with the same writer gate", vacantUpsert.includes("当前空缺") && teamStore(vacantEnv).length === 1);
+check("§9.2.2: an existing team is never re-seeded — upsert-team left the hand-written vacant row vacant", teamStore(vacantEnv)[0].roles[0].current === null && teamStore(vacantEnv)[0].roles[0].history.length === 0);
 
 // --- U4: writer policy on a seated team -------------------------------------
 const permEnv = teamEnv({ teams: [teamRow({ current: "session-self" })] });
@@ -1758,6 +1825,18 @@ const rotListOut = await rotListEnv.tool("team_link_list_sessions").execute({}, 
 check("U6 provisional 可见面: list_sessions marks the unratified channel on the session row (§3.6.2 评审 #3)", rotListOut.includes("provisional 配对 1 条") && rotListOut.includes("24h 内未批准自动回退"));
 check("U6 provisional 可见面: the marker sits before the reading stamp, so the row still ends with the stamp", /- session-worker-a[^\n]*provisional 配对 1 条（换届临时信任：24h 内未批准自动回退，见 team_link_roster）（读数 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，>2min 作废）/u.test(rotListOut));
 
+// 🔵 §9.6 ⑧ (计数口径): the count must agree with the delivery side. 评审 #8 made
+// an expired provisional record "no pair" for gate purposes; counting it here
+// would advertise a bypass channel that has already closed.
+const rotListExpiredEnv = (() => {
+	const env = setup({ sessions: [{ header: { id: "session-worker-a", createdAt: 1000, cwd: CWD }, live: true, persisted: true }], useSettings: true, selfCwd: CWD, extraAgents: [{ id: "session-worker-a", status: "idle" }] });
+	const ns = env.settings.namespaces.get("team-link");
+	ns.data.pairs = [{ a: SUCCESSOR, b: "session-worker-a", createdAt: 1, provisional: true, expiresAt: Date.now() - 1000 }];
+	return { ...env, ns };
+})();
+const rotListExpiredOut = await rotListExpiredEnv.tool("team_link_list_sessions").execute({}, execFor(rotListExpiredEnv.senderAgent));
+check("🔵 §9.6 ⑧: a provisional pair past its deadline is not counted as a live provisional channel (same liveness predicate as the delivery side)", rotListExpiredOut.includes("session-worker-a") && !rotListExpiredOut.includes("provisional 配对"));
+
 const rotRollbackNow = rotProvClaimAt + 24 * 3600000 + 60000;
 const rotRollbackSweep = await rotProvEnv.rotation.sweep({ now: rotRollbackNow });
 check("U6: at the 24h mark the sweep deletes the provisional pairs (评审 #5)", rotRollbackSweep.expired.length === 1 && rotProvEnv.ns.data.pairs.length === 0 && pairSummary(rotProvEnv) === "");
@@ -2055,11 +2134,108 @@ const rotGoalPrep = await rotGoalEnv.rotate.execute({ action: "prepare", team: "
 const rotGoalClaim = await rotGoalEnv.rotate.execute({ action: "claim", team: "night-shift", role: "coordinator", token: tokenOf(rotGoalPrep) }, rotGoalEnv.exec(SUCCESSOR));
 check("M4 红线: a whole rotation never calls goals.resume — the successor is only ADVISED (§3.7 合规回路)", rotResumeCalls === 0 && rotGoalClaim.includes("换届完成") && rotGoalPrep.includes("/goal resume"));
 
+// ---------------------------------------------------------------------------
+// §9 收尾修复（0.3.7）: U9 settings 时序锁 / U10 创建即认领 / U11 降级红线
+// ---------------------------------------------------------------------------
+
+// --- U9: the settings seam is a TIMING contract, not a snapshot (§9.1.3) -----
+// Every environment above provides `settings` BEFORE `apply()`, so all of them
+// can only ever exercise the fast path. Production does the opposite — the
+// settings provider finishes its `[Service.init]` (load settings.yaml, then
+// publish) after this plugin activates — and the pre-fix store read
+// `ctx.get("settings")` exactly once, at apply time, then fell back to process
+// memory silently and permanently (teams / watchdogs / pairs never reached
+// disk). This case reproduces the production ORDER: apply first, provider later.
+// The provider side is a real cordis Context, so `provide` after the fact is
+// what fires the plugin's `ctx.inject(["settings"], …)` callback — the stub is
+// not allowed to shortcut that (§9.1.4).
+
+const lateEnv = setup({
+	sessions: [],
+	lateSettings: true,
+	selfCwd: TEAM_WS,
+	// Pre-loaded into the legacy namespace by the stub's own register (the state a
+	// provider would have read from settings.yaml), so the one-time rename
+	// migration — which now runs from `attach` — has something to migrate. That
+	// is the evidence that the call site really moved off apply time.
+	settingsSeed: { "session-link-pro": { receiveMode: "accept", trustedSenders: ["session-legacy"] } },
+});
+check("U9 前置: at activation the provider is not active yet — nothing registered, exactly one warn and no info line", lateEnv.settings.namespaces.size === 0 && lateEnv.log.lines.warn.length === 1 && lateEnv.log.lines.warn[0].includes("settings not active at activation") && lateEnv.log.lines.info.length === 0);
+await lateEnv.provideSettings();
+check("U9: the store attaches once the provider goes active and says so in exactly one info line", lateEnv.settings.namespaces.has("team-link") && lateEnv.log.lines.info.filter((line) => line.includes('policy store attached to settings namespace "team-link"')).length === 1);
+check("U9: the one-time legacy migration runs from the attach, not from apply (session-link-pro → team-link)", lateEnv.settings.namespaces.get("team-link")?.data.receiveMode === "accept" && (lateEnv.settings.namespaces.get("team-link")?.data.trustedSenders ?? []).join(",") === "session-legacy");
+const lateRoster = lateEnv.tool("team_link_roster");
+const lateCreateOut = await lateRoster.execute({ action: "upsert-team", team: "night-shift" }, execFor(lateEnv.senderAgent));
+check("U9: a write after the late attach lands in the settings namespace — persistence, not process memory", (lateEnv.settings.namespaces.get("team-link")?.data.teams ?? []).length === 1 && lateEnv.settings.namespaces.get("team-link")?.data.teams[0].name === "night-shift" && lateCreateOut.includes("已创建团队 night-shift"));
+check("U9: the lazy retries stay silent — still exactly one warn for the whole startup window", lateEnv.log.lines.warn.length === 1);
+
+// The same race, second site (§9.1.3 第三处): the export route is taken from the
+// runtime channel too, so it must be mounted on a late webServer instead of being
+// lost to one apply-time snapshot.
+const lateWsEnv = setup({ sessions: [], lateWebServer: true });
+check("U9 对照 (webServer): with no active webServer the route is not mounted, and the degradation is announced instead of silent", lateWsEnv.routes.length === 0 && lateWsEnv.log.lines.warn.some((line) => line.includes("webServer service unavailable at activation")));
+await lateWsEnv.provideWebServer();
+check("U9 对照 (webServer): the same late-attach pattern mounts the export route once the provider appears", lateWsEnv.routes.length === 1 && lateWsEnv.routes[0].kind === "exact" && lateWsEnv.routes[0].path === "/team-link/export");
+
+// Data consistency across the same window (§9.1.3 数据一致性, defensive redundancy):
+// the memory engine can only be written before the attach. If that happens, the
+// write must be folded into settings rather than silently dropped.
+const memWindowEnv = setup({ sessions: [], lateSettings: true, selfCwd: TEAM_WS });
+const memWindowOut = await memWindowEnv.tool("team_link_roster").execute({ action: "upsert-team", team: "night-shift" }, execFor(memWindowEnv.senderAgent));
+check("U9 对照 (数据一致性): a write inside the startup window is served by the memory engine (no settings namespace exists yet)", memWindowOut.includes("已创建团队 night-shift") && memWindowEnv.settings.namespaces.size === 0);
+await memWindowEnv.provideSettings();
+check("U9 对照 (数据一致性): the window's write is folded into the settings namespace at attach instead of being dropped, with one line saying so", (memWindowEnv.settings.namespaces.get("team-link")?.data.teams ?? []).length === 1 && memWindowEnv.log.lines.warn.some((line) => line.includes("memory-only startup window")) && memWindowEnv.log.lines.info.filter((line) => line.includes("policy store attached")).length === 1);
+
+// --- U10 (§3.3.2 创建即认领 / §9.2.2): bootstrap, no hijack, gates untouched ---
+const u10Env = teamEnv({ teams: [] });
+const u10Roster = u10Env.tool("team_link_roster");
+const u10Create = await u10Roster.execute({ action: "upsert-team", team: "night-shift" }, execFor(u10Env.senderAgent));
+check("U10: the creation path seeds the creating session as coordinator.current, in the same write", u10Create.includes("coordinator 已由创建会话 session-self 认领") && teamStore(u10Env)[0].roles.length === 1 && teamStore(u10Env)[0].roles[0].current === "session-self");
+const u10ForeignUpsert = await u10Roster.execute({ action: "upsert-team", team: "night-shift" }, execFor(u10Env.targetAgent));
+check("U10: a non-incumbent cannot hijack an existing team through upsert-team — the seed never runs twice and the gate still refuses", u10ForeignUpsert.includes("只有现任协调者会话 session-self 可写") && teamStore(u10Env)[0].roles.length === 1 && teamStore(u10Env)[0].roles[0].current === "session-self");
+const u10SetRole = await u10Roster.execute({ action: "set-role", team: "night-shift", role: "coordinator", session: "session-target", note: "夜班接手" }, execFor(u10Env.senderAgent));
+check("U10: the creating session can write immediately — set-role goes through (the bootstrap really unlocks M2–M4)", u10SetRole.includes("已设置") && teamStore(u10Env)[0].roles[0].current === "session-target");
+const u10RolesAfterHandover = JSON.stringify(teamStore(u10Env)[0].roles);
+const u10Idempotent = await u10Roster.execute({ action: "upsert-team", team: "night-shift" }, execFor(u10Env.targetAgent));
+check("U10: upsert-team on an existing team is still idempotent — roles/version history byte-identical, no re-seed for the new incumbent", u10Idempotent.includes("已存在") && u10Idempotent.includes("幂等") && JSON.stringify(teamStore(u10Env)[0].roles) === u10RolesAfterHandover);
+const u10ExtraArg = await rejects(u10Roster, { action: "upsert-team", team: "day-shift", coordinator: "session-target" }, execFor(u10Env.senderAgent));
+check("U10: the tool surface has no `coordinator` parameter (§9.2.2 不新增 API 面), and an undeclared id cannot seed the role — the seed is always the calling session", Object.keys(u10Roster.parameters.properties).sort().join(",") === "action,note,role,session,team" && teamStore(u10Env).find((team) => team.name === "day-shift")?.roles[0].current === "session-self" && !String(u10ExtraArg).includes("session-target"));
+check("U10: a HAND-WRITTEN vacant row (settings UI) still answers 「空缺 → 设置 UI」 for set-role and for upsert-team — writerGate is untouched", vacantSetRole.includes("当前空缺") && vacantSetRole.includes("设置 UI") && vacantUpsert.includes("当前空缺"));
+const u10VacantRetire = await vacantRoster.execute({ action: "retire", team: "night-shift", role: "coordinator" }, execFor(vacantEnv.senderAgent));
+check("U10: ... and retire on that vacant row is refused the same way — retireGate is untouched", u10VacantRetire.includes("当前空缺") && u10VacantRetire.includes("设置 UI"));
+
+// --- U11 (§5.3 红线): no settings at all ⇒ full function, exactly one line ----
+const bareEnv = setup({ sessions: [{ header: { id: "session-lv-silent", createdAt: 1000, cwd: TEAM_WS }, live: true, persisted: true }], eventsBySession: { "session-lv-silent": ancientEvents("silent") }, extraAgents: [{ id: "session-lv-silent", status: "idle" }], selfCwd: TEAM_WS });
+check("U11: with no settings service the whole tool surface still registers", ["team_link_list_sessions", "team_link_export", "team_link_send", "team_link_watch", "team_link_roster", "team_link_team_read", "team_link_team_append", "team_link_rotate"].every((toolName) => bareEnv.tool(toolName) !== undefined));
+check("U11: 有且仅有一行 warn for the activation window — no info line, no silent fallback", bareEnv.log.lines.warn.length === 1 && bareEnv.log.lines.warn[0].includes("settings not active at activation") && bareEnv.log.lines.info.length === 0);
+const bareRoster = bareEnv.tool("team_link_roster");
+const bareCreate = await bareRoster.execute({ action: "upsert-team", team: "day-shift" }, execFor(bareEnv.senderAgent));
+const bareSetRole = await bareRoster.execute({ action: "set-role", team: "day-shift", role: "coordinator", session: "session-target" }, execFor(bareEnv.senderAgent));
+const bareAppend = await bareEnv.tool("team_link_team_append").execute({ team: "day-shift", file: "decisions", line: "内存引擎下的裁决" }, execFor(bareEnv.senderAgent));
+const bareRead = await bareEnv.tool("team_link_team_read").execute({ team: "day-shift" }, execFor(bareEnv.senderAgent));
+check("U11: M2 stays fully usable on the memory engine (create → set-role → 黑板 append → read back)", bareCreate.includes("已创建团队 day-shift") && bareSetRole.includes("已设置") && bareAppend.includes("已追加 decisions #1") && bareRead.includes("内存引擎下的裁决"));
+check("U11: the lazy retries never add a line — still exactly one warn after a full M2 round trip", bareEnv.log.lines.warn.length === 1 && bareEnv.log.lines.info.length === 0);
+const bareList = await bareEnv.tool("team_link_list_sessions").execute({}, execFor(bareEnv.senderAgent));
+check("U11: the goals degradation is unchanged — a missing service renders goal=? and the list still works", bareList.includes("goal=?") && !bareList.includes("列出会话失败"));
+
+// The documented second branch: a context without `ctx.inject` (§9.1.3 ②) says so
+// in its own line, and the lazy retry is then the whole recovery path.
+const lazyEnv = setup({ sessions: [], lateSettings: true, noInject: true, selfCwd: TEAM_WS });
+check("U11: without ctx.inject the memory fallback is announced in a second, explicit line", lazyEnv.log.lines.warn.length === 2 && lazyEnv.log.lines.warn[1].includes("ctx.inject unavailable"));
+await lazyEnv.provideSettings();
+check("U11 前置: with nothing registered for injection the late provider is not picked up on its own", lazyEnv.settings.namespaces.size === 0);
+const lazyOut = await lazyEnv.tool("team_link_roster").execute({ action: "upsert-team", team: "night-shift" }, execFor(lazyEnv.senderAgent));
+check("U11: the first tool call retries lazily and attaches (§9.1.3 ③) — the write lands in settings and one info line is left", lazyOut.includes("已创建团队 night-shift") && (lazyEnv.settings.namespaces.get("team-link")?.data.teams ?? []).length === 1 && lazyEnv.log.lines.info.filter((line) => line.includes("policy store attached")).length === 1);
+check("U11: ... and the retry did not repeat the activation warn (still exactly two lines: the window and the missing ctx.inject)", lazyEnv.log.lines.warn.length === 2);
+
 // cleanup
 rmSync(tmpDir, { recursive: true, force: true });
 rmSync(TEAM_TMP, { recursive: true, force: true });
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
+// §9.6 ⑧: the run states its own assertion total, so the README figure (and any
+// future changelog figure) is checkable against the run instead of remembered.
+console.log(`assertion total: ${assertions} (failed: ${failures})`);
 process.exit(failures === 0 ? 0 : 1);
 
 /** Drive the agent/pre-step waterfall the way the loop does. */

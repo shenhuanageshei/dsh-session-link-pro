@@ -65,21 +65,38 @@ function makeTargetAgent(status = "idle") {
  * `register` — the divergence-audit path where the store can never attach and
  * every lazy retry re-enters the catch. `legacyRegisterThrows` keeps the current
  * namespace working and refuses only `session-link-pro`, the one-line clause of
- * 评审 #4 (an unavailable legacy namespace must say so).
+ * 评审 #4 (an unavailable legacy namespace must say so). `legacyGetThrows` is the
+ * other half of that story (评审 round-2 🔵 #3): the legacy namespace registers
+ * fine but cannot be READ, which is the branch that used to return with no log
+ * at all.
+ *
+ * `markDead()` (评审 round-2 🟡 #1) models a provider that is gone: the scopes it
+ * handed out stop serving. No test flips it by hand — the provider is mounted
+ * through a real cordis plugin fiber (see `provideSettingsFiber`) and the fiber's
+ * own teardown effect is what retires the stub.
  */
-function makeSettings(seed = {}, { settingsRegisterThrows = false, legacyRegisterThrows = false } = {}) {
+function makeSettings(seed = {}, { settingsRegisterThrows = false, legacyRegisterThrows = false, legacyGetThrows = false } = {}) {
 	const namespaces = new Map();
+	let alive = true;
+	const guard = () => { if (!alive) throw new Error("settings provider disposed (its fiber was torn down)"); };
 	return {
 		namespaces,
+		markDead() { alive = false; },
 		service: {
 			register(namespace, _schema, options = {}) {
 				if (settingsRegisterThrows) throw new Error("register refused by stub");
 				if (legacyRegisterThrows && String(namespace) === "session-link-pro") throw new Error("legacy namespace refused by stub");
+				guard();
+				const isLegacy = String(namespace) === "session-link-pro";
 				const state = { base: structuredClone(options.base ?? {}), data: structuredClone(seed[String(namespace)] ?? {}) };
 				namespaces.set(String(namespace), state);
 				return {
-					get() { return { ...structuredClone(state.base), ...structuredClone(state.data) }; },
-					async update(patch) { Object.assign(state.data, structuredClone(patch)); },
+					get() {
+						guard();
+						if (isLegacy && legacyGetThrows) throw new Error("legacy namespace unreadable by stub");
+						return { ...structuredClone(state.base), ...structuredClone(state.data) };
+					},
+					async update(patch) { guard(); Object.assign(state.data, structuredClone(patch)); },
 				};
 			},
 		},
@@ -154,6 +171,10 @@ function makeQuery(sessions, eventsBySession = {}, surfaceReadHook) {
 	return query;
 }
 
+/** One macrotask of slack: enough for cordis' async fiber work and for the
+ * attach-time policy chain (which is fire-and-forget by design) to settle. */
+const tick = () => new Promise((resolve) => { setTimeout(resolve, 0); });
+
 /**
  * Build a full plugin environment on a fresh cordis Context.
  *
@@ -167,7 +188,7 @@ function makeQuery(sessions, eventsBySession = {}, surfaceReadHook) {
  * `ctx.inject` before `apply` to cover the documented "ctx.inject unavailable"
  * branch.
  */
-function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, lateSettings = false, lateWebServer = false, noInject = false, settingsSeed, settingsRegisterThrows = false, legacyRegisterThrows = false, selfCwd, omitUserQuestions = false, surfaceReadHook } = {}) {
+function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, lateSettings = false, lateWebServer = false, noInject = false, settingsSeed, settingsRegisterThrows = false, legacyRegisterThrows = false, legacyGetThrows = false, selfCwd, omitUserQuestions = false, surfaceReadHook } = {}) {
 	const ctx = new Context();
 	// Every plugin log line lands in `log.lines` instead of the console: the
 	// service-attach red line (§5.3) is asserted on the lines themselves.
@@ -230,7 +251,7 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 		roots() { return [senderAgent, targetAgent, runnerAgent, ...extraAgentObjects.filter((agent) => agent.session?.header?.origin !== "subagent")]; },
 	};
 	const uq = makeUserQuestions(askScript);
-	const settings = useSettings || lateSettings ? makeSettings(settingsSeed, { settingsRegisterThrows, legacyRegisterThrows }) : undefined;
+	const settings = useSettings || lateSettings ? makeSettings(settingsSeed, { settingsRegisterThrows, legacyRegisterThrows, legacyGetThrows }) : undefined;
 	ctx.provide("sessionReferenceResolver", resolver);
 	ctx.provide("tools", { register(tool) { registeredTools.push(tool); return () => {}; } });
 	const query = makeQuery(sessions, eventsBySession, surfaceReadHook);
@@ -259,7 +280,26 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 		ctx.provide("webServer", webServerService);
 		await new Promise((resolve) => { setTimeout(resolve, 0); });
 	};
-	return { ctx, prepared, setFailWith: (error) => { failWith = error; }, setHiddenAgent: (id, value) => { if (value) hidden.add(id); else hidden.delete(id); }, registeredTools, routes, senderAgent, senderCalls, targetAgent, targetCalls, uq, tool, settings, log, query, provideSettings, provideWebServer, agentFor: (id) => agents.get(id), extraCalls };
+	/** 评审 round-2 🟡 #1 handle: mount the settings stub as a REAL cordis plugin
+	 * fiber, so `fiber.dispose()` retires the service through cordis itself (which
+	 * deactivates the plugin's `ctx.inject(["settings"], …)` fiber — the event the
+	 * store's lifetime binding must react to). Mounting a fresh stub afterwards
+	 * models the provider coming back with a new service instance. No hand-rolled
+	 * "disposed" switch is involved: the stub only loses its backing store because
+	 * the effect below runs when that fiber is torn down. */
+	const provideSettingsFiber = async (stub = settings) => {
+		const fiber = ctx.plugin({
+			name: "settings-provider-stub",
+			apply(providerCtx) {
+				providerCtx.provide("settings", stub.service);
+				providerCtx.effect(() => () => stub.markDead(), "settings-provider-stub: provider teardown");
+			},
+		});
+		await fiber.await();
+		await tick();
+		return fiber;
+	};
+	return { ctx, prepared, setFailWith: (error) => { failWith = error; }, setHiddenAgent: (id, value) => { if (value) hidden.add(id); else hidden.delete(id); }, registeredTools, routes, senderAgent, senderCalls, targetAgent, targetCalls, uq, tool, settings, log, query, provideSettings, provideSettingsFiber, provideWebServer, agentFor: (id) => agents.get(id), extraCalls };
 }
 
 function execFor(agent) {
@@ -2257,13 +2297,15 @@ check("U11: ... and the retry did not repeat the activation warn (still exactly 
 
 // --- F1 (差异审计 · 唯一实质分歧): a provider that is ACTIVE but refuses ----
 // `register` is the second arrival path of the same "not attached" warn. When
-// the provider is already active, attachFrom() reports "attached" on every call,
-// so the activation branch below never runs and — pre-fix — nothing latched a
-// one-shot gate: each get()/update() re-entered the register catch and the warn
-// had no upper bound (audit probe: 3 get + 1 upsert ⇒ 11 warns). §9.1.3 ③ puts
-// both paths behind the same `attachWarned` gate, counted over the whole startup
-// window (U11). The assertions below count only this plugin's settings lines, so
-// the webServer warn of an unrelated branch cannot mask a missing gate.
+// the provider is already active, attachFrom() answers `"attached"` — or
+// `"refused"` when the provider answered but `register` threw (评审 round-2
+// 🔵 #2 turned its boolean into a reason code) — so the activation branch below
+// never runs and — pre-fix — nothing latched a one-shot gate: each get()/update()
+// re-entered the register catch and the warn had no upper bound (audit probe:
+// 3 get + 1 upsert ⇒ 11 warns). §9.1.3 ③ puts both paths behind the same
+// `attachWarned` gate, counted over the whole startup window (U11). The
+// assertions below count only this plugin's settings lines, so the webServer
+// warn of an unrelated branch cannot mask a missing gate.
 const settingsWarnsOf = (lines) => lines.filter((line) => line.includes("dsh-team-link: settings "));
 
 // This fixture is the audit's own shape: the provider IS active when the plugin
@@ -2294,6 +2336,63 @@ check("F1 对照: the register failure that arrives second does NOT add a line �
 const legacyEnv = setup({ sessions: [], useSettings: true, legacyRegisterThrows: true, selfCwd: TEAM_WS });
 check("评审 #4: the current namespace still attaches while the legacy one is refused", legacyEnv.settings.namespaces.has("team-link") && !legacyEnv.settings.namespaces.has("session-link-pro") && legacyEnv.log.lines.info.filter((line) => line.includes("policy store attached")).length === 1);
 check("评审 #4: ... and the unavailable legacy namespace leaves one line naming it and the skipped migration", legacyEnv.log.lines.warn.length === 1 && legacyEnv.log.lines.warn[0].includes(`legacy namespace "session-link-pro" unavailable`) && legacyEnv.log.lines.warn[0].includes("不会自动迁移"));
+
+// --- 评审 round-2 🔵 #3: the attach-time chain is observable end to end -------
+// `void adoptMemoryWindow().then(() => migrateLegacyPolicy()).catch(…)` used to
+// be fire-and-forget with a silent catch, and `migrateLegacyPolicy`'s early read
+// failure returned with no line at all — so neither "migrated" nor "skipped" nor
+// "failed" could be read off the store. Each attach now names both steps in one
+// info line, and the read failure that used to be swallowed leaves a warn.
+// The chain deliberately stays fire-and-forget on the fast path, so the fixture
+// installed synchronously above needs one yield before its line can be read.
+await tick();
+check("🔵 #3: the attach-time chain names both steps' outcomes in one info line (migrated path)", lateEnv.log.lines.info.some((line) => line.includes("post-attach policy chain finished") && line.includes("memory window: none (no writes while unattached)") && line.includes("legacy migration: migrated")));
+check("🔵 #3: \"nothing to migrate\" is observable too — the skipped path is named, not left to inference", legacyEnv.log.lines.info.some((line) => line.includes("post-attach policy chain finished") && line.includes("legacy migration: no legacy namespace")));
+// The branch that had no line whatsoever: the legacy namespace registers but
+// cannot be read. Pre-fix this fixture produced a completely silent skip.
+const unreadableLegacyEnv = setup({ sessions: [], useSettings: true, legacyGetThrows: true, selfCwd: TEAM_WS });
+await tick();
+check("🔵 #3: a legacy namespace that cannot be READ leaves a warn naming the skipped migration (pre-fix: no line at all)", unreadableLegacyEnv.log.lines.warn.some((line) => line.includes(`legacy namespace "session-link-pro" could not be read`) && line.includes("本次未迁移")) && unreadableLegacyEnv.log.lines.info.some((line) => line.includes("legacy migration: legacy read failed")));
+
+// --- 评审 round-2 🟡 #1: a disposed provider must not leave a dead scope ------
+// §9.1.3 binds the settings scope to the fiber of the context that produced it —
+// the rule the webServer site already follows (`target.effect(() => webServer
+// .register(…))`). Without the binding, a late `ctx.inject(["settings"], …)`
+// attach outlives its provider: `scope` stays non-null while dead, every
+// `update()` throws into the caller's「写入设置失败」path and every `get()`
+// silently answers from stale process memory — and no retry can ever re-attach,
+// because the retry is gated on `scope === null`. The provider below is a real
+// cordis plugin fiber (see `provideSettingsFiber`): it is retired by disposing
+// that fiber, never by a hand-flipped flag.
+const deadEnv = setup({ sessions: [], lateSettings: true, selfCwd: TEAM_WS });
+check("🟡 #1 前置: the provider is late — activation leaves the one warn and nothing registered", deadEnv.log.lines.warn.length === 1 && deadEnv.settings.namespaces.size === 0);
+const firstProvider = await deadEnv.provideSettingsFiber();
+const deadRoster = deadEnv.tool("team_link_roster");
+const beforeDispose = await deadRoster.execute({ action: "upsert-team", team: "night-shift" }, execFor(deadEnv.senderAgent));
+check("🟡 #1 前置: with the provider up the store attaches on the late path and the write lands in its namespace", beforeDispose.includes("已创建团队 night-shift") && (deadEnv.settings.namespaces.get("team-link")?.data.teams ?? []).map((team) => team.name).join(",") === "night-shift" && deadEnv.log.lines.info.filter((line) => line.includes("policy store attached")).length === 1);
+
+await firstProvider.dispose();
+await tick();
+check("🟡 #1: disposing the provider's fiber releases the scope — one line says the store is memory-only again", deadEnv.log.lines.info.some((line) => line.includes("settings scope released with its owner fiber") && line.includes("memory-only")));
+
+const whileDetached = await deadRoster.execute({ action: "upsert-team", team: "detached-team" }, execFor(deadEnv.senderAgent));
+check("🟡 #1: after the provider is gone the store is UNATTACHED rather than attached-to-a-dead-scope — the write is served by the memory engine instead of failing against the dead scope", whileDetached.includes("已创建团队 detached-team") && !whileDetached.includes("写入设置失败"));
+check("🟡 #1: ... and nothing was written through the dead scope (its namespace still holds exactly the pre-disposal state)", (deadEnv.settings.namespaces.get("team-link")?.data.teams ?? []).map((team) => team.name).join(",") === "night-shift");
+
+// The provider comes back as a restarted provider would: a FRESH service
+// instance (a new stub), which is what makes "re-attached to the new provider"
+// observable rather than merely "still holding the old one".
+const revived = makeSettings({ "team-link": { teams: [teamRow({ name: "carried-team", writer: "any" })] } });
+await deadEnv.provideSettingsFiber(revived);
+check("🟡 #1: when the provider returns, the lazy path re-attaches — a second attach line, against the new provider", deadEnv.log.lines.info.filter((line) => line.includes('policy store attached to settings namespace "team-link"')).length === 2 && revived.namespaces.has("team-link"));
+const revivedRead = await deadRoster.execute({ action: "get" }, execFor(deadEnv.senderAgent));
+check("🟡 #1: reads now come from the new provider's namespace — stale process memory no longer masquerades as the store's state", revivedRead.includes("carried-team") && !revivedRead.includes("detached-team"));
+const afterRevival = await deadRoster.execute({ action: "upsert-team", team: "after-team" }, execFor(deadEnv.senderAgent));
+check("🟡 #1: ... and writes follow the live provider too (persistence is not pinned to the first scope)", afterRevival.includes("已创建团队 after-team") && (revived.namespaces.get("team-link")?.data.teams ?? []).map((team) => team.name).join(",") === "carried-team,after-team");
+// Every attach states what happened to the memory-only window, including the
+// case where it is deliberately NOT adopted — a window write that settings
+// outranks is named, not dropped in silence (🔵 #3).
+check("🔵 #3: every attach reports the window outcome — the un-adopted window write is named, not silently dropped", deadEnv.log.lines.info.filter((line) => line.includes("post-attach policy chain finished")).length === 2 && deadEnv.log.lines.info.some((line) => line.includes("memory window: not folded (settings namespace already in use)")));
 
 // cleanup
 rmSync(tmpDir, { recursive: true, force: true });

@@ -503,7 +503,7 @@ sequenceDiagram
 2. ~~watchdog tick 用方案 (a)（relay 形态、senderSessionId=观察者自身）是否被会话格式迁移接受——需在真实日志上跑一次迁移校验（实现 U3 时顺带验证）~~ → **契约层已验证（2026-09-18）**：`@deepseek-ai/dsh-session-format-v2-to-v3` 的迁移校验器要求 `source.kind === "agent-message"` 时成员集**恰为** `{kind, form, senderSessionId}`，且 `form === "relay"`、`senderSessionId` 为非空字符串；未知 kind 与未审计成员一律拒绝（`lib/index.js:29` 白名单、`:125-132` 逐条校验）。与本插件 tick 的投递形态**逐字一致**。**残留（如实标注）**：端到端「在真实日志上跑一次迁移」仍待有真实 tick 落盘后执行——U3 的单测断言是回归锁，不替代端到端。
 3. ~~dsh-schedule overlay 是否随 profile 默认启用（影响自 tick 引导文案的默认值；注意 N6 两条采用约束）~~ → **已定档（2026-09-18）**：本 profile **未挂载** schedule——`@deepseek-ai/dsh-schedule` 与 `dsh-client-ui-schedule` 虽在 profile 的 node_modules 中（传递依赖），但既不在 `dsh.profile.bundles`、也无 `cordis.patch.yml` 的 mount 行，且不在 `dsh-base` 的依赖清单内；当前运行时也未暴露 schedule 工具（当次实测）。**决定**：文档引导文案**不得假设 schedule 可用**——自 tick 引导一律以「看门狗 + 自建 goal」为默认路径，schedule 仅作「若你另装了该 overlay」的可选提示；**本轮不改 profile**（是否启用属用户的配置决定；若启用须注意 N6 的两条采用约束：overlay 须在会话创建前启用、reminder 不随 roster 迁移）。
 4. （可选取证）解压夜班协调者日志（session-9c05bcaf），复核 00:31 静默的具体触发器（max-tokens / 重启 / 配置热更 / pause / 未建 goal）——机制链已证，触发路径属历史取证，不阻塞实施（会诊 D-1）。
-5. GitHub 仓库是否随插件改名（`shenhuanageshi/dsh-session-link-pro` → `dsh-team-link`）：不改名也能推送（当前 URL 可用）；改名则旧链接由 GitHub 自动重定向。属外部动作，**待用户决定**（§9.5）。
+5. ~~GitHub 仓库是否随插件改名~~ → **已改名（2026-09-18）**：`shenhuanageshei/dsh-session-link-pro` → **`shenhuanageshei/dsh-team-link`**（`gh repo rename`；旧地址由 GitHub 自动重定向）。本地 `origin`、README 的克隆地址与 `package.json` 的 `repository.url` 均已同步到新名。
 
 ---
 
@@ -701,7 +701,7 @@ function createPolicyStore(ctx) {
 - **版本**：`package.json` 0.3.0 → **0.3.7**，与 README changelog 已有的 0.3.1–0.3.6 对齐收口，并新增 0.3.7 条目记录本次修复（消除「版本号 vs changelog」漂移）。
 - **合并**：`rename/dsh-team-link` → `main`（先核 `merge-base --is-ancestor`，可快进则 `--ff-only`，保持线性史）。
 - **标签**：`v0.3.7`。
-- **推送**：`origin`（当前 URL 仍为旧仓名 `dsh-session-link-pro`，推送本身可用；**仓库是否改名由用户决定**，见 §7-5）。
+- **推送**：`origin` —— 仓库**已改名**为 `dsh-team-link`（§7-5），本地 remote 与文档/清单地址已同步；`main`（485fd03）与标签 `v0.3.7`（05b1f97）均已推送成功（2026-09-18：期间 `github.com:443` 一度不可达，恢复后一次通过）。
 - **归档**：旧目录内评审脚手架 `.review/`（6 文件）与 `.review-target.md`（均 untracked）——经用户确认后清理。
 
 ### 9.6 清单闭合（逐项，不留未声明尾巴）

@@ -499,7 +499,7 @@ sequenceDiagram
 
 ## 7. 开放问题（实施前需确认）
 
-1. V9 的插件侧编程创建会话：客户端契约已证 session.create/session.fork（换届选 create 不选 fork），dsh-sdk-protocol 另有「未知 session id 惰性创建」线索（sdk-app 未挂载）——影响 §3.6.4 是否升级为全自动创建（不阻塞 M4）。
+1. ~~V9 的插件侧编程创建会话：客户端契约已证 session.create/session.fork（换届选 create 不选 fork），dsh-sdk-protocol 另有「未知 session id 惰性创建」线索（sdk-app 未挂载）——影响 §3.6.4 是否升级为全自动创建（不阻塞 M4）~~ → **API 面已验证（2026-09-18）**：本版本宿主面 `@deepseek-ai/dsh-agent` 的 agents 服务**暴露** `create(options: CreateAgentOptions): Promise<AgentHandle>`（`lib/types/index.d.ts:279`；实现 `lib/index.js:408-422`），语义是「通过已注册工厂**构造 agent 及其 session**」（与只登记已构造对象的 `register` 相区别）；`CreateAgentOptions` 要求调用方自带 `sessionId: SessionId`，可选 `meta{cwd, parentSession, isSeeded, origin, delegationDepth}`（`:48-72`）。本插件**已注入 `agents`**（lib/index.js:62），故插件侧编程建会话在 0.1.5 上**可达**。**残留（如实标注）**：(a) 运行时工厂是否已注册（`agents.setFactory`）以及 headless 派生会话是否可用，**未做真机验证**；(b) **决策：本轮不把 §3.6.4 升级为全自动建会话**——半自动兜底已在 §3.6.4 设计且不依赖该 API，升级属**显式推迟**的功能变更（若做，选 create 不选 fork，见 V9）。
 2. ~~watchdog tick 用方案 (a)（relay 形态、senderSessionId=观察者自身）是否被会话格式迁移接受——需在真实日志上跑一次迁移校验（实现 U3 时顺带验证）~~ → **契约层已验证（2026-09-18）**：`@deepseek-ai/dsh-session-format-v2-to-v3` 的迁移校验器要求 `source.kind === "agent-message"` 时成员集**恰为** `{kind, form, senderSessionId}`，且 `form === "relay"`、`senderSessionId` 为非空字符串；未知 kind 与未审计成员一律拒绝（`lib/index.js:29` 白名单、`:125-132` 逐条校验）。与本插件 tick 的投递形态**逐字一致**。**残留（如实标注）**：端到端「在真实日志上跑一次迁移」仍待有真实 tick 落盘后执行——U3 的单测断言是回归锁，不替代端到端。
 3. ~~dsh-schedule overlay 是否随 profile 默认启用（影响自 tick 引导文案的默认值；注意 N6 两条采用约束）~~ → **已定档（2026-09-18）**：本 profile **未挂载** schedule——`@deepseek-ai/dsh-schedule` 与 `dsh-client-ui-schedule` 虽在 profile 的 node_modules 中（传递依赖），但既不在 `dsh.profile.bundles`、也无 `cordis.patch.yml` 的 mount 行，且不在 `dsh-base` 的依赖清单内；当前运行时也未暴露 schedule 工具（当次实测）。**决定**：文档引导文案**不得假设 schedule 可用**——自 tick 引导一律以「看门狗 + 自建 goal」为默认路径，schedule 仅作「若你另装了该 overlay」的可选提示；**本轮不改 profile**（是否启用属用户的配置决定；若启用须注意 N6 的两条采用约束：overlay 须在会话创建前启用、reminder 不随 roster 迁移）。
 4. （可选取证）解压夜班协调者日志（session-9c05bcaf），复核 00:31 静默的具体触发器（max-tokens / 重启 / 配置热更 / pause / 未建 goal）——机制链已证，触发路径属历史取证，不阻塞实施（会诊 D-1）。
@@ -714,7 +714,7 @@ function createPolicyStore(ctx) {
 | ⑦ | M5 积压（回执全量 / sidecar） | 维持 §2.1 积压，不在本轮 | 显式推迟 |
 | ⑧ | 2 个 🔵（断言总数自校验、provisional 计数口径） | **并入本轮测试补强阶段**：`host-half.test.mjs` 结尾输出断言总数（供 README 计数自校验）；`list_sessions` 的 provisional 计数措辞对齐。验收 = U8 复跑中可见该输出与措辞 | §9.1.5 / U8 |
 | ⑨ | dsh-schedule overlay 默认启用 | **已定档**：本 profile 未挂载（无 mount 行、不在 bundles、不在 dsh-base 依赖）→ 引导文案不假设其可用；是否启用仍属用户配置决定（本轮不改 profile） | §7-3 |
-| ⑩ | §7-1 V9 / §7-2 tick source 校验 / §7-4 夜班取证 | §7-2 **契约层已验**（迁移校验器源码逐条比对）；端到端待真实 tick。§7-1 / §7-4 原样保留 | §7 显式不阻塞 |
+| ⑩ | §7-1 V9 / §7-2 tick source 校验 / §7-4 夜班取证 | §7-1 **API 面已验证**（agents.create/createAgent 存在且插件已注入 agents；全自动升级显式推迟）；§7-2 **契约层已验**（迁移校验器源码逐条比对），端到端待真实 tick；§7-4 原样保留 | §7 显式不阻塞 |
 
 ### 9.7 会诊 #36 意见处置
 

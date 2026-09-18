@@ -188,7 +188,7 @@ const tick = () => new Promise((resolve) => { setTimeout(resolve, 0); });
  * `ctx.inject` before `apply` to cover the documented "ctx.inject unavailable"
  * branch.
  */
-function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, lateSettings = false, lateWebServer = false, noInject = false, settingsSeed, settingsRegisterThrows = false, legacyRegisterThrows = false, legacyGetThrows = false, selfCwd, omitUserQuestions = false, surfaceReadHook } = {}) {
+function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, lateSettings = false, lateWebServer = false, noInject = false, settingsSeed, settingsRegisterThrows = false, legacyRegisterThrows = false, legacyGetThrows = false, selfCwd, omitUserQuestions = false, surfaceReadHook, webServerWithoutRegister = false } = {}) {
 	const ctx = new Context();
 	// Every plugin log line lands in `log.lines` instead of the console: the
 	// service-attach red line (§5.3) is asserted on the lines themselves.
@@ -262,7 +262,10 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 	if (!omitUserQuestions) ctx.provide("userQuestions", uq.service);
 	// `lateWebServer` models the second site of the same race (§9.1.3): the
 	// header export route is taken from the runtime channel too.
-	const webServerService = { register(route) { routes.push(route); return () => {}; } };
+	// `webServerWithoutRegister` (评审 round-3 🔵 #4) models the other reason code
+	// of that seam: a service that IS there but cannot take a route — the branch
+	// whose wording must come from the same single read.
+	const webServerService = webServerWithoutRegister ? {} : { register(route) { routes.push(route); return () => {}; } };
 	if (!lateWebServer) ctx.provide("webServer", webServerService);
 	if (settings !== undefined && !lateSettings) ctx.provide("settings", settings.service);
 	// The `goals` service is optional by design (§3.1): absent here means the
@@ -2347,7 +2350,7 @@ check("评审 #4: ... and the unavailable legacy namespace leaves one line namin
 // installed synchronously above needs one yield before its line can be read.
 await tick();
 check("🔵 #3: the attach-time chain names both steps' outcomes in one info line (migrated path)", lateEnv.log.lines.info.some((line) => line.includes("post-attach policy chain finished") && line.includes("memory window: none (no writes while unattached)") && line.includes("legacy migration: migrated")));
-check("🔵 #3: \"nothing to migrate\" is observable too — the skipped path is named, not left to inference", legacyEnv.log.lines.info.some((line) => line.includes("post-attach policy chain finished") && line.includes("legacy migration: no legacy namespace")));
+check("🔵 #3: the skipped path is named, not left to inference — and 🔵 #5: a REFUSED legacy register now reads as refused instead of as 「没有旧命名空间」", legacyEnv.log.lines.info.some((line) => line.includes("post-attach policy chain finished") && line.includes("legacy migration: legacy namespace refused (register failed)")));
 // The branch that had no line whatsoever: the legacy namespace registers but
 // cannot be read. Pre-fix this fixture produced a completely silent skip.
 const unreadableLegacyEnv = setup({ sessions: [], useSettings: true, legacyGetThrows: true, selfCwd: TEAM_WS });
@@ -2393,6 +2396,66 @@ check("🟡 #1: ... and writes follow the live provider too (persistence is not 
 // case where it is deliberately NOT adopted — a window write that settings
 // outranks is named, not dropped in silence (🔵 #3).
 check("🔵 #3: every attach reports the window outcome — the un-adopted window write is named, not silently dropped", deadEnv.log.lines.info.filter((line) => line.includes("post-attach policy chain finished")).length === 2 && deadEnv.log.lines.info.some((line) => line.includes("memory window: not folded (settings namespace already in use)")));
+
+// --- 评审 round-3 🟡 #1: the one-shot gate counts WINDOWS, not the process ----
+// `detach()` ends an unattached window (its scopes died with their owner fiber),
+// so the next window has to be able to speak for itself. Pre-fix the gate stayed
+// latched for the process lifetime: a provider that came BACK and then REFUSED
+// `register` produced no warn at all — the only trace was the release line's
+// "memory-only until it attaches again", which cannot distinguish 仍在等 from
+// 被拒绝 (silent refusal is the original ③ defect). The provider side is a real
+// cordis plugin fiber, as in the 🟡 #1 case above: window 1 attaches against a
+// working provider, that fiber is disposed, and window 2 is a provider that
+// answers but refuses.
+const windowGateEnv = setup({ sessions: [], lateSettings: true, selfCwd: TEAM_WS });
+check("🟡 #1 前置: window 1 announces itself once (the activation line) and registers nothing", settingsWarnsOf(windowGateEnv.log.lines.warn).length === 1 && settingsWarnsOf(windowGateEnv.log.lines.warn)[0].includes("settings not active at activation") && windowGateEnv.settings.namespaces.size === 0);
+const windowGateProvider1 = await windowGateEnv.provideSettingsFiber();
+check("🟡 #1 前置: window 1 attaches against the provider that returns, still at one warn for that window", windowGateEnv.log.lines.info.filter((line) => line.includes('policy store attached to settings namespace "team-link"')).length === 1 && settingsWarnsOf(windowGateEnv.log.lines.warn).length === 1);
+await windowGateProvider1.dispose();
+await tick();
+check("🟡 #1 前置: disposing that fiber ends window 1 — scopes released with one line, store unattached again", windowGateEnv.log.lines.info.some((line) => line.includes("settings scope released with its owner fiber")) && windowGateEnv.log.lines.info.filter((line) => line.includes("policy store attached")).length === 1);
+await windowGateEnv.provideSettingsFiber(makeSettings({}, { settingsRegisterThrows: true }));
+check("🟡 #1: window 2's refusal is announced — the gate re-opened together with the window (pre-fix: zero lines, a silently refused window)", settingsWarnsOf(windowGateEnv.log.lines.warn).length === 2 && settingsWarnsOf(windowGateEnv.log.lines.warn)[1].includes("settings register failed"));
+const windowGateWrite = await windowGateEnv.tool("team_link_roster").execute({ action: "upsert-team", team: "second-window" }, execFor(windowGateEnv.senderAgent));
+check("🟡 #1: ... and window 2 is still exactly ONE warn — the lazy retries behind the refusal add nothing (窗口内语义未变)", windowGateWrite.includes("已创建团队 second-window") && settingsWarnsOf(windowGateEnv.log.lines.warn).length === 2 && windowGateEnv.log.lines.info.filter((line) => line.includes("policy store attached")).length === 1);
+
+// --- 评审 round-3 🔵 #3: the memory-window flag dies with its window ---------
+// The flag exists to fold writes made before the attach. Pre-fix it was never
+// cleared, so a SECOND, brand-new provider was fed the same (already resolved)
+// memory state again — a second fold plus a second 「该窗口理论不可达」 warn: the
+// flag's lifetime claimed a window that had already been resolved.
+const refoldEnv = setup({ sessions: [], lateSettings: true, selfCwd: TEAM_WS });
+await refoldEnv.tool("team_link_roster").execute({ action: "upsert-team", team: "window-one" }, execFor(refoldEnv.senderAgent));
+const refoldFolds = () => refoldEnv.log.lines.warn.filter((line) => line.includes("memory-only startup window"));
+const refoldProvider = await refoldEnv.provideSettingsFiber();
+await tick();
+check("🔵 #3 前置: window 1's memory write is folded into the namespace exactly once, with one warn and the matching chain token", (refoldEnv.settings.namespaces.get("team-link")?.data.teams ?? []).map((team) => team.name).join(",") === "window-one" && refoldFolds().length === 1 && refoldEnv.log.lines.info.some((line) => line.includes("memory window: folded into settings")));
+await refoldProvider.dispose();
+await tick();
+// A brand-new provider whose namespace is empty — the shape that used to be
+// re-fed the previous window's memory state.
+const refoldFresh = makeSettings();
+await refoldEnv.provideSettingsFiber(refoldFresh);
+await tick();
+check("🔵 #3: the flag does not outlive its window — the new provider is NOT re-fed the resolved state (no second fold, no second 「理论不可达」 warn)", refoldFresh.namespaces.has("team-link") && (refoldFresh.namespaces.get("team-link")?.data.teams ?? []).length === 0 && refoldFolds().length === 1 && (refoldEnv.log.lines.info.filter((line) => line.includes("post-attach policy chain finished")).at(-1) ?? "").includes("memory window: none (no writes while unattached)"));
+
+// --- 评审 round-3 🔵 #5: 「旧命名空间被拒」≠「根本没有旧命名空间」 ---------
+// The refused case is `legacyEnv` above (its chain line now names the refusal).
+// This is the other half of the same value set: a legacy namespace that REGISTERS
+// fine but holds nothing reads as "no legacy data" — the token the refused case
+// used to collapse into.
+const emptyLegacyEnv = setup({ sessions: [], useSettings: true, selfCwd: TEAM_WS });
+await tick();
+check("🔵 #5: a legacy namespace that registers but holds nothing reads as 「no legacy data」 — the skip tokens are distinct values, not one", emptyLegacyEnv.log.lines.info.some((line) => line.includes("post-attach policy chain finished") && line.includes("legacy migration: no legacy data")));
+
+// --- 评审 round-3 🔵 #4: the webServer line's wording comes from the ONE read --
+// Same reason-code shape as `attachFrom`: a service that IS there without
+// `register()` is named as such, so no second `ctx.get("webServer")` is needed to
+// pick the wording (a second read could observe a different moment and describe a
+// state that was never true).
+const registerlessWsEnv = setup({ sessions: [], webServerWithoutRegister: true });
+const registerlessWarns = registerlessWsEnv.log.lines.warn.filter((line) => line.includes("webServer service unavailable at activation"));
+check("🔵 #4: a webServer without register() is named by its reason code — 「no register()」, not 「not yet active」", registerlessWarns.length === 1 && registerlessWarns[0].includes("(no register())") && registerlessWsEnv.routes.length === 0);
 
 // cleanup
 rmSync(tmpDir, { recursive: true, force: true });

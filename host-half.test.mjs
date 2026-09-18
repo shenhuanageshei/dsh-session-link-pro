@@ -96,8 +96,16 @@ function makeUserQuestions(script) {
 	};
 }
 
-function makeQuery(sessions, eventsBySession = {}) {
-	return {
+/**
+ * @param surfaceReadHook - optional probe run at the START of every surface
+ * read. The list tool's read window (§3.1: bounded to PREVIEW_SESSIONS, and
+ * parallel) is asserted through it: a read sequenced behind the previous one
+ * resolves with a different in-flight count than a parallel batch.
+ */
+function makeQuery(sessions, eventsBySession = {}, surfaceReadHook) {
+	const query = {
+		/** ids whose surface was read, in call order — the read-window bound. */
+		surfaceReads: [],
 		async listSessions(_signal) { return sessions; },
 		async readTitleSnapshots(ids, _signal) {
 			return ids.map((id) => ({ status: "fulfilled", value: { session: { id }, title: id === "session-target" ? "目标会话" : id === "session-runner" ? "跑着呢" : undefined } }));
@@ -108,15 +116,18 @@ function makeQuery(sessions, eventsBySession = {}) {
 			return { session: { id, createdAt: 1700000000000, cwd: CWD }, events };
 		},
 		async readSurface(id) {
+			query.surfaceReads.push(id);
+			if (surfaceReadHook !== undefined) await surfaceReadHook(id);
 			const events = eventsBySession[id];
 			if (events === undefined) throw new Error(`session not found: ${id}`);
 			return { session: { id }, capturedThroughSeq: events.length, events };
 		},
 	};
+	return query;
 }
 
 /** Build a full plugin environment on a fresh cordis Context. */
-function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, selfCwd, omitUserQuestions = false } = {}) {
+function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStatus = "idle", contextText = "SNIPPET", omitContext = false, goals, extraAgents = [], selfStatus, useSettings = false, selfCwd, omitUserQuestions = false, surfaceReadHook } = {}) {
 	const ctx = new Context();
 	const prepared = [];
 	let failWith = null;
@@ -168,7 +179,8 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 	const settings = useSettings ? makeSettings() : undefined;
 	ctx.provide("sessionReferenceResolver", resolver);
 	ctx.provide("tools", { register(tool) { registeredTools.push(tool); return () => {}; } });
-	ctx.provide("sessionQuery", makeQuery(sessions, eventsBySession));
+	const query = makeQuery(sessions, eventsBySession, surfaceReadHook);
+	ctx.provide("sessionQuery", query);
 	ctx.provide("agents", agents);
 	// `omitUserQuestions` models a shell without the confirmation service (the
 	// M2 retirement cleanup and the M1 send gates must both degrade, not crash).
@@ -180,7 +192,7 @@ function setup({ sessions = [], eventsBySession = {}, askScript = [], targetStat
 	if (goals !== undefined) ctx.provide("goals", { get(agent) { return goals[agent.id]; } });
 	apply(ctx);
 	const tool = (name) => registeredTools.find((candidate) => candidate.name === name);
-	return { ctx, prepared, setFailWith: (error) => { failWith = error; }, setHiddenAgent: (id, value) => { if (value) hidden.add(id); else hidden.delete(id); }, registeredTools, routes, senderAgent, senderCalls, targetAgent, targetCalls, uq, tool, settings, agentFor: (id) => agents.get(id), extraCalls };
+	return { ctx, prepared, setFailWith: (error) => { failWith = error; }, setHiddenAgent: (id, value) => { if (value) hidden.add(id); else hidden.delete(id); }, registeredTools, routes, senderAgent, senderCalls, targetAgent, targetCalls, uq, tool, settings, query, agentFor: (id) => agents.get(id), extraCalls };
 }
 
 function execFor(agent) {
@@ -365,6 +377,58 @@ const noGoalsEnv = setup({
 const noGoalsOut = await noGoalsEnv.tool("team_link_list_sessions").execute({}, execFor(noGoalsEnv.senderAgent));
 check("liveness: without the goals service the goal face degrades to ? and the list still works", noGoalsOut.includes("goal=?") && !noGoalsOut.includes("列出会话失败"));
 check("liveness: without the goals service the no-goal verdict path still fires", noGoalsOut.includes("verdict=silent-idle"));
+
+// ---------------------------------------------------------------------------
+// §3.1 read window: the surface reads of the list tool are BOUNDED to
+// PREVIEW_SESSIONS rows and run in PARALLEL (production bug: one SERIAL surface
+// read per listed session — up to LIST_LIMIT = 50 cold zstd logs — overran the
+// 60s tool timeout on a real 26-session workspace).
+// ---------------------------------------------------------------------------
+
+const WIN_IDS = Array.from({ length: 14 }, (_, index) => `session-win-${String(index).padStart(2, "0")}`);
+// session-win-05 is deliberately unreadable INSIDE the window: one rejecting log
+// must degrade that row alone, never the window around it.
+const WIN_BROKEN = WIN_IDS[5];
+const winEvents = Object.fromEntries(WIN_IDS.slice(0, 12).filter((id) => id !== WIN_BROKEN).map((id) => [id, ancientEvents(`窗口主题 ${id}`)]));
+// The probe is the parallelism evidence: all 12 reads are started from one batch,
+// so by the time the first of them resolves the counter already reads 12. A
+// serial loop resolves its first read with the counter still at 1.
+let winStarted = 0;
+let winInFlightAtFirstResolve = 0;
+const winEnv = setup({
+	sessions: WIN_IDS.map((id, index) => ({ header: { id, createdAt: 1000 + index, cwd: CWD }, live: true, persisted: true })),
+	eventsBySession: winEvents,
+	extraAgents: WIN_IDS.map((id) => ({ id, status: "idle" })),
+	surfaceReadHook: async () => {
+		winStarted += 1;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		if (winInFlightAtFirstResolve === 0) winInFlightAtFirstResolve = winStarted;
+	},
+});
+const winOut = await winEnv.tool("team_link_list_sessions").execute({}, execFor(winEnv.senderAgent));
+const winRows = winOut.split(/\n(?=- session-win-)/u).filter((block) => block.startsWith("- session-win-"));
+const winRowOf = (id) => winRows.find((block) => block.startsWith(`- ${id} `));
+
+check("§3.1 window: readSurface is called for the first PREVIEW_SESSIONS rows and for no others", winEnv.query.surfaceReads.length === 12 && winEnv.query.surfaceReads.every((id, index) => id === WIN_IDS[index]) && !winEnv.query.surfaceReads.includes(WIN_IDS[12]));
+check("§3.1 window: the 12 window reads run in PARALLEL — all of them were in flight before the first resolved", winStarted === 12 && winInFlightAtFirstResolve === 12);
+check("§3.1 window: all 14 rows still list, each with exactly one 活性 line (rows past the window degrade, they are not dropped)", winRows.length === WIN_IDS.length && (winOut.match(/^    活性：/gmu) ?? []).length === WIN_IDS.length);
+check("§3.1 window: row 13 (index 12) says it was not read instead of showing a verdict", (() => {
+	const block = winRowOf(WIN_IDS[12]);
+	return block !== undefined && block.includes(`活性：未读（超出快照窗口 12）`) && !block.includes("verdict=") && !block.includes("主题：");
+})());
+check("§3.1 window: a row past the window keeps its surface-free faces (id, agent state, creation time, reading stamp)", (() => {
+	const block = winRowOf(WIN_IDS[13]);
+	return block !== undefined && block.includes("○ 空闲") && block.includes("创建于") && /（读数 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，>2min 作废）/u.test(block);
+})());
+check("§3.1 window: rows inside the window keep their computed verdict and digest", (() => {
+	const tailRow = winRowOf(WIN_IDS[11]);
+	return tailRow !== undefined && tailRow.includes("verdict=silent-idle") && tailRow.includes(`主题：窗口主题 ${WIN_IDS[11]}`);
+})());
+check("§3.1 window: one unreadable log inside the window degrades that row alone (unknown silence on it, the rows around it still read)", (() => {
+	const broken = winRowOf(WIN_BROKEN);
+	const neighbour = winRowOf(WIN_IDS[6]);
+	return broken !== undefined && broken.includes("静默 ?") && neighbour !== undefined && neighbour.includes("verdict=silent-idle") && neighbour.includes(`主题：窗口主题 ${WIN_IDS[6]}`);
+})());
 
 // ---------------------------------------------------------------------------
 // -pro: export tool

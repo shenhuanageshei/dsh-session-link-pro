@@ -2,7 +2,7 @@
 
 > **文档用途**：本文档是 `team-upgrade-research-2026-09-17.md`（下称《调研》）§5 提案的实施级修正设计。对《调研》§7 议题的裁决、DSH 0.1.5 源码验证事实、会诊 #27 的意见处置记录在 §1.2 / §8。机制均带伪代码与 schema；验收标准对齐仓库既有测试形态（`host-half.test.mjs`）。
 >
-> **状态**：v1.3（2026-09-17 设计评审 PASS，token d950e9c5…3209；10 条 advisory 全部折入：retire 语义 §3.3.2、tick 状态归属与自指拒绝 §3.2.4、pending 过期清扫与回退终态 §3.6.2、provisional 可见面三处 §3.6.2/§5.2、空缺寻址 §3.4、U2 补 dead 分支、数值上限 §4.1、P6 映射 §1.1、《调研》supersession 指针）。更名与 v1.2 沿革见 README「更名通告」。插件版本基线 0.3.0（rename 分支），DSH 0.1.5。
+> **状态**：v1.4（2026-09-18 增补 §9「收尾修复设计」：settings seam 静默失效与建队引导自锁的修复、清单闭合、发布收尾；**§1–§4、§6、§8 保持 v1.3 原文不变，§5/§7 按 §9.4 增量**——v1.3 的设计评审 PASS 与 token d950e9c5…3209 记录为：10 条 advisory 全部折入：retire 语义 §3.3.2、tick 状态归属与自指拒绝 §3.2.4、pending 过期清扫与回退终态 §3.6.2、provisional 可见面三处 §3.6.2/§5.2、空缺寻址 §3.4、U2 补 dead 分支、数值上限 §4.1、P6 映射 §1.1、《调研》supersession 指针）。更名与 v1.2 沿革见 README「更名通告」。插件版本基线 0.3.0（rename 分支），DSH 0.1.5。
 
 ---
 
@@ -230,6 +230,7 @@ teams:
 - **retire 语义**（评审 #1 补）：仅由现任协调者会话或用户发起；效果 = 该角色 current 置空（vacant）+ history 追加带 note 的退役记录。retire 本身不动 pairs（它不携带信任授予）；但提供可选「顺带清理」：单个用户对话框列出全部指向退役会话的 pairs/trustedSenders/rememberTargets（复用 §3.6.1 原则 3 的对称撤销代码），勾选后清理。不清理也无安全洞（pairs 照旧过门），只是死数据堆积——选择权留给用户。
 - 写权限：policy.writer === "coordinator" 时仅 coordinator.current 会话可写（exec.agent.id 校验）；任何会话可读。settings UI 永远可改（用户是超级写者）。
 - set-role 副作用：若被替换会话存在 pairs，不自动迁移——迁移只发生在 rotation 流程（§3.6），避免绕过换届令牌。
+- **创建即认领（bootstrap，§9.2 落地）**：`upsert-team` 在**创建**路径把调用会话播种为 coordinator 现任（`roles: [{ role: "coordinator", current: caller, ... }]`）。理由：创建路径本就不过 `writerGate`，此刻无在任者可侵犯；否则会产生「团队已存在但 coordinator 空缺 ⇒ 所有会话路径写不进」的死锁（工具路径与设置 UI 路径同时不可用，2026-09-18 实测）。`writerGate` / `retireGate` 既有语义不变——**手写**的空缺行仍然全拒。
 
 #### 3.3.3 黑板（team/ 目录约定）
 
@@ -342,6 +343,7 @@ function sweepExpiredPendings() {
 //   send 走 provisional pair 时返回文案后缀 "（provisional 通道，24h 内未批准自动回退）"；信封 meta 不扩字段。
 ```
 
+```js
 // ---- 实现评审补丁（0.3.4 代码评审 round 1/2 落地，as-of 2eb6d11）----
 // P1（已落定判据）：claim/sweep 的「已落定」信号 = current === pending.session（prepare 拒绝自换保证全新
 //     pending 无此态）；migratedPairs 仅作清单，不再是落定判据（空标记落定态曾致重放把继任者当退役者）。
@@ -352,6 +354,8 @@ function sweepExpiredPendings() {
 //     防止后续 claim 误走 replay 跳过对称撤销。
 // P4（重放状态词）：claim 落定时把状态词记入 role.rotationStatus（schema 显式声明防 settings 往返抹除），
 //     replayClaim 直读记录值，不再从残留字段重推。
+```
+
 #### 3.6.3 时序图
 
 ```mermaid
@@ -460,6 +464,9 @@ sequenceDiagram
 | U6 | rotate/claim：错令牌/过期令牌/跨 team-role-successor 绑定不匹配→拒绝；非 pending.session 发起→拒绝；claim 幂等（重试不重复迁移）；团队外与未勾选 pairs 不迁移；退役者持有的 pairs/trustedSenders/rememberTargets 对称吊销；provisional TTL 到点回退 | §3.6 |
 | U7 | 信封 banner：meta 枚举校验、超长 ref 截断、banner 首行格式 | §3.4 |
 | U8 | 既有全部用例不回归（深链/导出/双门/配对/wellFormed） | 回归红线 |
+| U9 | settings 时序回归锁（§9.1）：**先跑 apply、之后才提供 settings** → store 最终挂到 settings 且写入落在 stub 的命名空间；同时断言挂载成功留一行 info（修复前此用例必红） | §9.1 |
+| U10 | 建队自举（§9.2）：创建路径 → `coordinator.current` = 创建者，且该会话随后 `set-role` 成功；团队已存在时 `roles` 不变（幂等，非现任无法借此劫持）；**手写空缺行**（设置 UI 产出）时仍返回既有的「空缺→设置 UI」提示（U4 语义保留） | §9.2 |
+| U11 | 降级红线（§9.1.3）：settings 彻底缺失时全功能仍可用（内存引擎）且**有且仅有一行** warn；goals 缺失仍渲染 `?` | §9.1 / §5.3 |
 
 ### 5.2 集成验收（双/多会话手工演练脚本，每项写明期望）
 
@@ -469,13 +476,15 @@ sequenceDiagram
 4. **换届白航**：同上但用户在场单次确认 → pairs 正式迁移 + 旧 pairs/trustedSenders 清理 + roster.md 镜像一致。
 5. **广播策展**：worker 尝试 team:night/* → 拒绝；协调者发 → 三 worker 各自独立过门投递。
 6. **审计自包含**：export 任一参与会话，信封首行（type/pri/ref）在 md 导出中完整可读。
+7. **冷启动自举（§9）**：真实 DSH 冷启动后，在**不手改 YAML** 的前提下完成「建团队（创建会话自动认领 coordinator）→ 派活 → 黑板读写」；随后检查 `profile\settings.yaml` 出现 `team-link:` 段（落盘实证），并确认 `dsh-web.out.log` 有一行 `policy store attached to settings namespace`。
 
 ### 5.3 红线（任一破坏即拒绝合并）
 
 - source 白名单三成员不变（V10）；
 - fan-out 不绕门、rotation 迁移不出团队域、provisional 必带 TTL；
 - 所有新增模型可见输出过 wellFormed 门槛（沿用 textOutput 约定）；
-- goals 服务缺失时插件功能完整降级（仅 goal 信号显示 ?）。
+- goals 服务缺失时插件功能完整降级（仅 goal 信号显示 ?）；
+- **服务获取不得静默失效**（§9.1.3 / §9.3）：settings 未能立刻挂载时必须留一行 warn，挂载成功留一行 info——不得存在任何第二次静默回退。
 
 ---
 
@@ -494,6 +503,7 @@ sequenceDiagram
 2. watchdog tick 用方案 (a)（relay 形态、senderSessionId=观察者自身）是否被会话格式迁移接受——需在真实日志上跑一次迁移校验（实现 U3 时顺带验证）。
 3. dsh-schedule overlay 是否随 profile 默认启用（影响自 tick 引导文案的默认值；注意 N6 两条采用约束）。
 4. （可选取证）解压夜班协调者日志（session-9c05bcaf），复核 00:31 静默的具体触发器（max-tokens / 重启 / 配置热更 / pause / 未建 goal）——机制链已证，触发路径属历史取证，不阻塞实施（会诊 D-1）。
+5. GitHub 仓库是否随插件改名（`shenhuanageshi/dsh-session-link-pro` → `dsh-team-link`）：不改名也能推送（当前 URL 可用）；改名则旧链接由 GitHub 自动重定向。属外部动作，**待用户决定**（§9.5）。
 
 ---
 
@@ -534,3 +544,187 @@ sequenceDiagram
 ### 8.2 修订清单（本节处置对正文的全部落点）
 
 §1.2（V5/V6/V8/V9 重写）· §1.3（A1 四态化、A2 带约束、A3 对称撤销、新增 A4）· §2.2（非目标 #6，标题计数四→六）· §3.1（LivenessSignal 增 blockedReason、verdict 增 goal-disarmed、实现注）· §3.2.3（patrol 四态 + 诊断型 tick + watcher-dead 分支）· §3.2.4（采用约束与覆盖面声明）· §3.4（总线理由重写）· §3.6.1（原则 1/3/4 强化、诚实声明、错峰段）· §3.6.2（令牌绑定与幂等、对称撤销、对话框勾选）· §3.7（停态全景表、tick 四态表、合规 resume 回路图）· §4.1（watchdog/rotation 两行）· §5.1（U1/U2/U6 断言更新）· §7（开放问题 1/3 更新、新增 4）。
+
+---
+
+## 9. 收尾修复设计（2026-09-18，v1.4）
+
+> **本节定位**：0.3.7 收尾迭代的设计。修复 2026-09-18 真实部署中**实测**到的两个功能性阻塞（③ settings 持久化静默失效、④ 建队引导自锁），并闭合发布侧与清单剩余项。**§1–§8 的 M1–M4 机制设计全部不动**，本节只做增量；文中所有实测数字均为当次取值。
+
+### 9.1 缺陷 ③：settings 持久化静默失效
+
+#### 9.1.1 实测现象与取证（先现象，后归因）
+
+| 环节 | 实测 | 判读 |
+|---|---|---|
+| 写入返回 | `team_link_watch(action="register")` 返回「已注册看门狗 wd-…」；紧接 `action="list"` 可见该条目 | 写**在进程内成功** |
+| 磁盘 | `profile\settings.yaml` 的 mtime / 大小在写入前后均未变，全文无 `team-link` 键 | 写**未到 provider** |
+| 机制排除 | `dsh-settings-file` 的 `update()` → `await this.persist(ns, section)`（dsh-settings-file/lib/index.js:163-177、dsh-settings/lib/index.js:463），无防抖、无批处理 | 若走 provider 必然落盘 → 说明根本没走 |
+| 日志排除 | `dsh-web.out.log` / `dsh-web.err.log` 中**从未**出现本插件的 `settings namespace unavailable` warn | 不是「register 抛错被 catch」那条路径（该路径必留 warn，见 lib/index.js:880） |
+| 同进程对照组 | goals 服务按需读取且解析成功：活性行渲染 `goal=none`；若服务缺失应渲染 `?`（lib/index.js:504） | `ctx.get` 本体可用，问题只落在 settings 这一处 |
+| 历史取证 | 全部 undo 快照（09-03 / 09-08 / 09-18 各期）与三份 settings 备份**均无** `session-link-pro` 或 `team-link` 段 | 自 0.2.x 起信任数据从未落盘；§9.1.3 的「旧命名空间一次性迁移」（`LEGACY_POLICY_NAMESPACE = "session-link-pro"`）在真实部署中是**空操作** |
+
+#### 9.1.2 根因（源码链）
+
+1. cordis `ctx.get(name, strict = true)` 的语义是「**不需要 inject** 从 store 读服务」（源码注释原文），但 `_getImpl` 里有 `if (strict && impl.fiber.state !== 2) return`——**只返回已 active 的提供方 fiber**（cordis/lib/index.js:762-771）。
+2. 本插件在 `apply` 期间**一次性**取服务：lib/index.js:3965 `const policy = createPolicyStore(ctx)`，而 `createPolicyStore` 在 :868 立即执行 `ctx.get?.("settings")`。
+3. 此刻 settings provider 的 fiber 若尚未 active（provider 的 `[Service.init]` 要先读盘并 publish，dsh-settings/lib/index.js:246-252），`ctx.get` 返回 `undefined`。
+4. :871 的守卫 `settings !== undefined && typeof settings.register === "function"` 不成立 → **静默**切到内存引擎（:883）。此后**无重试、无重绑定、无日志**——:871-882 只在 `register` 抛错时 warn，`settings === undefined` 分支一句日志都没有。
+5. 后果：store 永久停在内存引擎 → teams / watchdogs / pairs / rotation 全部不落盘，每次 DSH 重启清零。
+
+**不确定点（如实标注，不用结论冒充证据）**：第 3 步「provider fiber 尚未 active」是**由源码语义 + 日志缺失 + goals 对照组三者共同推出**的，尚未直接观测到那一刻的执行结果。替代假设是「settings 服务与插件处于不同 isolate，故 `ctx[symbols.isolate]["settings"]` 无键」（cordis/lib/index.js:766）。**两种假设指向同一修法族**（有序取服务或惰性取服务），故 §9.1.3 的设计不依赖该判别；而 §9.1.3 的「留痕」要求正是为了让这条判别在修复后能被一行日志一锤定音。
+
+#### 9.1.3 修复方案（三件套：可选有序注入 + 惰性重试 + 失败留痕）
+
+**设计决定**：**不采用**「把 `settings` 加进 `inject` 数组」的单一改法（那会把它变成硬依赖，与 §5.3 红线「服务缺失时插件完整降级」相抵），改用下述组合。
+
+```js
+function createPolicyStore(ctx) {
+	const memory = structuredClone(DEFAULT_POLICY);
+	let scope = null, legacyScope = null;
+	let engine = memoryEngine(memory);   // 默认内存引擎：降级红线保持
+
+	function attach(settings) {           // 幂等：只挂一次
+		if (scope !== null) return;
+		try {
+			scope = settings.register(POLICY_NAMESPACE, PolicyConfig, { base: structuredClone(DEFAULT_POLICY) });
+		} catch (error) {
+			ctx.logger?.warn?.(`${PLUGIN_LABEL}: settings register failed (${describeError(error)}) — 状态仅存进程内存`);
+			return;
+		}
+		try { legacyScope = settings.register(LEGACY_POLICY_NAMESPACE, PolicyConfig, { base: structuredClone(DEFAULT_POLICY) }); }
+		catch { legacyScope = null; }     // 旧命名空间仍为 best-effort
+		engine = settingsEngine(scope);
+		ctx.logger?.info?.(`${PLUGIN_LABEL}: policy store attached to settings namespace "${POLICY_NAMESPACE}"`);
+		void migrateLegacyPolicy();       // 迁移改到「挂上之后」执行，而非 apply 当场
+	}
+
+	// ① 立即试一次：同步提供方（测试 stub / 已 active 的 provider）走这条快路
+	const immediate = ctx.get?.("settings");
+	if (immediate !== undefined && typeof immediate.register === "function") attach(immediate);
+	// ② 否则留痕（红线：不得静默）并登记「等服务 active 后回调」的可选有序注入：不阻塞加载、不成为硬依赖
+	else {
+		ctx.logger?.warn?.(`${PLUGIN_LABEL}: settings not active at activation (${immediate === undefined ? "not yet active" : "no register()"}) — memory-only until it attaches; no persistence meanwhile`);
+		if (typeof ctx.inject === "function") {
+			ctx.inject(["settings"], (child) => {
+				const late = child.get?.("settings");
+				if (late !== undefined && typeof late.register === "function") attach(late);
+			});
+		} else {
+			ctx.logger?.warn?.(`${PLUGIN_LABEL}: ctx.inject unavailable — 依赖首次工具调用时的惰性重试兜底`);
+		}
+	}
+	// ③ 惰性兜底：get()/update() 每次调用时若 scope === null 再试一次 ctx.get("settings")；
+	//    成功即挂载并记 info；仍失败**不重复告警**（激活期已留一行 warn，保证 U11 的「有且仅有一行」）
+
+	return { get, update, migrateLegacyPolicy };
+}
+```
+
+要点与理由：
+
+- **确定性**：`ctx.inject(["settings"], cb)` 的回调只在服务 active 后运行（cordis 的注入等待语义），时序竞态被结构性消除；同时它不是硬依赖——服务永缺时插件照常加载并降级。
+- **保留快路**：同步提供方（含测试 stub）走 ①，不引入任何异步延迟，既有测试语义不变。
+- **数据一致性**：内存引擎只可能在「启动窗口」内被写入，而此刻尚无活动代理能调用工具；挂载时以 settings 为事实源，若内存期确有非默认值则按与 legacy 迁移同形的规则（仅当 settings 为默认时）并入——该窗口理论不可达，此条作为防御性冗余记录。
+- **留痕**（防复发，红线级）：任何「未能立刻挂载」必须留一行 warn；挂载成功留一行 info。**不得再存在第二次静默回退。**
+- **调用点迁移**：`migrateLegacyPolicy()` 由「apply 当场调用」改为「attach 之后调用」（apply 当场调用在 ③ 未修时恒为 no-op）。
+- **同类竞态的第三处（会诊 O6，本设计一并覆盖）**：`registerExportRoute`（lib/index.js:3909-3913）同样在 apply 期取 `ctx.get("webServer")` 时点快照；它已有 warn 与安全降级，但**同样受时序支配**——当前之所以导出路由可用，只是因为 webServer 的提供方恰好先于本插件 active（日志中**从未**出现 `:3912` 的 warn 即为此反证）。同一「晚挂 + 重试」模式覆盖：不可用时 `ctx.inject(["webServer"], child => registerExportRoute(child))`。
+- **已评估并否决的备选（会诊 O5）**：把 `"settings"` / `"webServer"` 直接加入 `inject` 数组。否决理由：`inject` 是**硬依赖**——依赖缺失时 cordis 令整个插件 fiber 不激活（`Fiber._refresh` → INACTIVE），本插件会连深链与导出工具一起消失，与 `:3912` 已声明的降级语义相抵；而 `ctx.inject` 与 `inject` 在**确定性**上等价（同样等待 provider 完成 `[Service.init]`，cordis/lib/index.js:1306）。**判决可逆**：若设计评审倾向 `inject`，回退为一行改动。
+
+#### 9.1.4 测试回归锁（说明真实缺口）
+
+现有 stub **已经覆盖 settings 路径**（`host-half.test.mjs:57-72` 的 `makeSettings()`，且大量断言直接读 `env.settings.namespaces.get("team-link")`）。**缺口不是「有没有 settings 服务」，而是「服务的提供时机」**：stub 在 ctx 构造时同步 `provide`，于是永远复现不出「apply 时 provider 尚未 active」这一生产条件。故新增 U9（§5.1）：先构造 ctx 并跑 apply，**之后再**提供 settings 服务，断言 store 最终挂到 settings 且写入落在 stub 的命名空间数据里——这条用例在修复前必须红。**U9 的 stub 必须忠实模拟 `ctx.inject` 的晚激活语义**（先 apply、后提供并触发回调），否则「确定性」就只被实现者自己写的 stub 验证；真机确认由演练 7 承担。
+
+#### 9.1.5 影响面（文件级）
+
+| 文件 | 改动 |
+|---|---|
+| `lib/index.js` | `createPolicyStore`（服务获取与引擎切换）、apply 内 `migrateLegacyPolicy` 调用点；:56 的 `inject` 数组**不改**（保持可选性） |
+| `host-half.test.mjs` | 新增 U9 / U10 / U11（回归仍由 §5.1 的 U8 覆盖） |
+| `README.md` | Changelog 增 0.3.7 条目；补「为什么团队状态现在能落盘」一句 |
+| 本文档 | §5.1 / §5.2 / §5.3 / §7 增量 + 本节 |
+
+无 schema 变化，无客户端改动。
+
+### 9.2 缺陷 ④：建队后首任协调者无法指定（引导自锁）
+
+#### 9.2.1 现状（代码路径已核）
+
+- `upsert-team` 在团队**不存在**时**跳过** `writerGate`（lib/index.js:1700-1704）→ 任何会话都能创建团队（自举必需）。
+- `set-role` **无条件**过 `writerGate`（:1731）。
+- `writerGate`（:1356-1367）：`policy.writer === "coordinator"` 且 coordinator 角色空缺时，**对任何会话路径一律拒绝**（:1361）。
+- 插件未调用 `installSection`，工具文案却把用户推向「设置 UI」（:1722）——人路径实际要手改 `settings.yaml`，而 ③ 令手改同样读不到。
+
+**结论**：模型能建出团队，但**永远写不进首任协调者** → 团队成为只读对象 → M2–M4 全部功能不可达。这正是「建队即死胡同」。
+
+#### 9.2.2 修复方案（原子自举，且不放宽任何既有门）
+
+`team_link_roster(action="upsert-team", team)` —— **不新增参数**（会诊 O8：无条件认领优于 opt-in，少一个 API 面，且结构性消除「建了却无人可写」的死队）：
+
+- **创建路径**（团队不存在）时：在**同一次写入**里把 `roles` 初始化为 `[{ role: "coordinator", current: <caller>, pending: null, history: [{ session: <caller>, from: now, until: null, note: "创建者自举" }] }]`。落点：`applyTeamUpsert`（lib/index.js:1399）+ `roleRecord`（:1297）产出规范形状；`TeamRoleConfig` 全字段有默认值，settings 往返安全，**PolicyConfig 零改动**（会诊 O9）。
+- 团队**已存在**时：`roles` 一律不改（保住 `upsert-team` 的幂等契约，使重试安全）；该路径仍过 `writerGate`，故**非现任不可能借此劫持他人团队**。
+- 无 caller（无会话身份）：创建路径本就要求 `exec.agent.id`（:1705 已保证），故不会产生「无人认领的半截团队」；文案随之改为「coordinator 已由创建会话认领」，删除 :1722 的「首任协调者需由用户经设置 UI 指定」。
+- **同步项（会诊 O10）**：host 测试 :1038（创建断言补 coordinator 行）、:1053-1056（U4 改用手写空缺 fixture 表达「空缺→全拒」语义）、:1872（rotation 创建流）；README:390 changelog 补一句；§3.3.2 补 bootstrap 规则行。`writerGate` / `retireGate` **一行不动**（U4 语义保留：手写空缺行仍然全拒并指向设置 UI）。
+- **不新增 schema 字段**（`roles`/`history` 结构不变，settings 往返不丢字段的既有断言继续成立）。
+- **与 §3.3.2 写权限模型的自洽性**：自举只发生在**创建**这一次、且只把创建者写成现任；创建者此后确实是现任，故与「写操作需现任身份」不冲突，也未新增除用户之外的第二条越权通道。
+
+#### 9.2.3 人路径（⑤）与范围声明
+
+- ③ 修好后 `team-link` 命名空间才**真正注册**；`dsh-settings` 的 `describe()` 会按 schema 描述每个已注册命名空间（dsh-settings/lib/index.js:351-381），设置面因此获得可编辑依据。
+- **不引入 `installSection`**：该 API 服务的是「组合配置 + 源钩子」（同文件 :327-343），本插件不需要；引入它会带来 UI 范围漂移。此决定为**显式不做**，不是遗漏。
+- **会诊 O3/O4 确认**：⑤ 是 ③ 的**纯下游**——`register` 成功即自动出现在设置面，故**不单列工项**；真机确认列入演练 7（「设置 UI 是否自动渲染全部已注册命名空间」仍属不可验项，见纪要 §5）。
+- README 增「自助引导」段：一段可直接粘贴的 `settings.yaml` 片段（`teams`→`roles`→`current`）＋说明——保存后由 `dsh-settings-file` 的 watcher 热加载（**外部手改是否触发 watcher 未经验证**，故同时写明「若不生效则重启 DSH」），作为与模型路径等价的备用入口。
+
+### 9.3 边界与防偏离（增补，接 §4）
+
+- **禁止第二次静默回退**：任何服务获取失败必须留一行 warn；U11 以断言锁死。
+- **自举不得放宽任何既有门**：创建者认领只在**创建**路径发生；已存在团队的 upsert 与 `set-role` 仍过 `writerGate`（U10 断言）。
+- 不引入 `installSection`、不改 §3 既有机制、不改 source 三成员与双门投递语义、不改任何 schema。
+
+### 9.4 验收增量的落点
+
+本节的验收增量**全部落到 §5.1（U9–U11）与 §5.2（演练 7）**，语义为：U9 = settings 时序回归锁；U10 = 创建者自举与不可劫持；U11 = 降级红线与唯一 warn；既有全部断言零回归仍由 §5.1 的 U8 覆盖；演练 7 = 真实 DSH 冷启动下零手工完成建队→派活，且磁盘出现 `team-link:` 段。
+
+### 9.5 发布收尾（清单 ①②⑥）
+
+**前置序（会诊 O11）**：③（含留痕）→ ④（创建认领 + 文案）→ 复跑全部断言 → 真机验证（演练 7）→ 才做本节（版本 / 合并 / tag / 推送 / 归档）。
+
+- **版本**：`package.json` 0.3.0 → **0.3.7**，与 README changelog 已有的 0.3.1–0.3.6 对齐收口，并新增 0.3.7 条目记录本次修复（消除「版本号 vs changelog」漂移）。
+- **合并**：`rename/dsh-team-link` → `main`（先核 `merge-base --is-ancestor`，可快进则 `--ff-only`，保持线性史）。
+- **标签**：`v0.3.7`。
+- **推送**：`origin`（当前 URL 仍为旧仓名 `dsh-session-link-pro`，推送本身可用；**仓库是否改名由用户决定**，见 §7-5）。
+- **归档**：旧目录内评审脚手架 `.review/`（6 文件）与 `.review-target.md`（均 untracked）——经用户确认后清理。
+
+### 9.6 清单闭合（逐项，不留未声明尾巴）
+
+| # | 项 | 收口方式 | 落点 |
+|---|---|---|---|
+| ① | 改名提交未合并未推送 | 合并 + tag + 推送 | §9.5 |
+| ② | 版本号漂移 | bump 到 0.3.7 并收口 changelog | §9.5 |
+| ③ | settings 持久化静默失效 | 有序注入 + 惰性重试 + 留痕 | §9.1 / U9 / U11 |
+| ④ | 建队引导自锁 | 创建路径原子自举 | §9.2.2 / U10 |
+| ⑤ | roster 引导无 UI 面 | 模型路径自足 + 文档化人路径 | §9.2.3 / U10 / 演练 7 |
+| ⑥ | 旧目录未归档 | 用户确认后清理 | §9.5 |
+| ⑦ | M5 积压（回执全量 / sidecar） | 维持 §2.1 积压，不在本轮 | 显式推迟 |
+| ⑧ | 2 个 🔵（断言总数自校验、provisional 计数口径） | **并入本轮测试补强阶段**：`host-half.test.mjs` 结尾输出断言总数（供 README 计数自校验）；`list_sessions` 的 provisional 计数措辞对齐。验收 = U8 复跑中可见该输出与措辞 | §9.1.5 / U8 |
+| ⑨ | dsh-schedule overlay 默认启用 | 待用户决定 | §7-3 |
+| ⑩ | §7-1 V9 / §7-2 tick source 校验 / §7-4 夜班取证 | 原样保留 | §7 显式不阻塞 |
+
+### 9.7 会诊 #36 意见处置
+
+会诊 #36（4 模型并行只读，2026-09-18，预算 20min）：**1/4 交付**（glm-5.3 给出源码级完整答案；deepseek-v4-pro / kimi-k3 / codex-cli:gpt-6-astra 均因预算超时失败，无内容可处置）。逐条裁定见 `docs/consult-minutes/2026-09-18-consult-36-minutes.md` §2（共 12 条：10 采纳 / 1 不采纳附理由 / 1 failed）；**有效数 = 1，交付数 ≠ 有效数**。
+
+对本节正文的落点：
+
+| 会诊意见 | 处置 | 落点 |
+|---|---|---|
+| `ctx.get` 是 strict 时点快照，apply 期取服务必须按激活时序（O1/O2） | 采纳 | §9.1.2 根因链、§9.1.3 有序化 |
+| 失败路径 = A（apply 时未激活），B/C 排除（O2） | 采纳 | §9.1.2 |
+| `register` 用法正确、无需改用 `installSection`（O3） | 采纳 | §9.2.3 |
+| ⑤ 是 ③ 的纯下游、无需单独工项（O4） | 采纳 | §9.2.3 / §9.6 ⑤ |
+| 修法 = 加进 `inject` 数组（O5） | **不采纳（机制层）**，理由见 §9.1.3 末条；判决可逆 | §9.1.3 |
+| `webServer`(:3910) 同类竞态（O6） | 采纳 | §9.1.3 第三处 |
+| 测试「不破」恰暴露时序缺口（O7） | 采纳并补 U9 | §9.1.4 / §5.1 U9 |
+| ④ 创建分支**无条件**认领（O8）+ 落点 `applyTeamUpsert`/`roleRecord`（O9） | 采纳 | §9.2.2 |
+| 测试 / README / §3.3.2 同步项（O10） | 采纳 | §9.2.2 同步项 |
+| 收尾顺序 ③→④→复跑→真机验证（O11） | 采纳 | §9.5 前置序 + §5.2 演练 7 |

@@ -1,6 +1,6 @@
 # 多会话联调实战调研 与 dsh-session-link-pro 升级设计（2026-09-17）
 
-> **更名通告**：本调研完成当日，插件已定名更名 `dsh-team-link`（0.3.0，分支 rename/dsh-team-link）。本文正文保留调研时点的旧名 `dsh-session-link-pro` 与 `session_link_pro_*` 工具名——它们是历史日志与证据链的准确记录，不做回写。实施级设计见 `team-upgrade-design-2026-09-17.md`（v1.2，工具名已更新为 `team_link_*`）。
+> **更名通告**：本调研完成当日，插件已定名更名 `dsh-team-link`（0.3.0，分支 rename/dsh-team-link）。本文正文保留调研时点的旧名 `dsh-session-link-pro` 与 `session_link_pro_*` 工具名——它们是历史日志与证据链的准确记录，不做回写。实施级设计见 `team-upgrade-design-2026-09-17.md`（当前 v1.4，工具名已更新为 `team_link_*`）。
 >
 > **效力声明（评审 #6 补）**：本文 §5 是**已被取代的提案**——以 `team-upgrade-design-2026-09-17.md` §3.0 的差异清单与 §8 处置表为准（要点：心跳重档改为看门狗+schedule 分工、砍总线、换届两阶段令牌制、banner 承载信封）。落地实现请勿以本文 §5 为据。
 

@@ -475,6 +475,41 @@ const atCapRow = renderSendRow(sendBlock({ ...SEND_CARD, targets: Array.from({ l
 check("评审 #2 对照: the cap is inclusive — a receipt at exactly 24 rows renders all 24 with NO truncation note", treeAllByClass(atCapRow, "dshsl-send-target").length === 24 && treeByClass(atCapRow, "dshsl-send-rows-trunc") === null);
 check("评审 #2 对照: ... and an ordinary 3-target receipt is untouched by the bound", treeAllByClass(cardRow, "dshsl-send-target").length === 3 && treeByClass(cardRow, "dshsl-send-rows-trunc") === null);
 
+// --- §10.1.2 行数界, the HOST half of the contract (U14, 2026-09-19 收尾轮) ---
+// The host half caps its OWN rows at the same 24 AS IT WRITES the receipt and
+// states the cut as `targetsTruncated: { shown, total }` (`lib/index.js`
+// `buildSendCard`). A client that only counts rows therefore reads a
+// host-produced card as "24 rows — not over the cap": it raises no truncation
+// note at all, and its label reports the DRAWN 24 for a 30-target delivery.
+// The mark is the only carrier of that fact, so A reads it (the receipt is
+// core-opaque and persisted — the mark is as untrusted as the rest of `meta`)
+// and the label takes `total` as the number it owes. Both ways a receipt can be
+// over the row bound then show up on the face that owns the rows.
+const hostCutTargets = Array.from({ length: 24 }, (_, i) => ({ sessionId: `session-worker-${i}`, outcome: "delivered", detail: `已投递到 session-worker-${i}` }));
+const hostCutCard = { ...SEND_CARD, targets: hostCutTargets, targetsTruncated: { shown: 24, total: 30 }, summary: { delivered: 30, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 } };
+const hostCutRow = renderSendRow(sendBlock(hostCutCard));
+check("U14 跨轮: a HOST-cut receipt (24 rows + the `targetsTruncated` mark) still renders as a card", isSendCard(hostCutRow) && !isSendPlain(hostCutRow));
+check("U14 跨轮: ... A states the truncation explicitly, at the mark's shown count", treeText(treeByClass(hostCutRow, "dshsl-send-rows-trunc")) === "（已截断——仅显示前 24 行）");
+check("U14 跨轮: ... and the label states the TRUE total (30) from the mark, not the 24 rows the host had already drawn", treeText(treeByClass(hostCutRow, "dshsl-send-rowhead")) === "✦ 工具调用 · team_link_send · 30 个目标");
+check("U14 跨轮: ... with exactly the 24 rows the host kept being what is drawn", treeAllByClass(hostCutRow, "dshsl-send-target").length === 24);
+check("U14 跨轮: both ways a receipt can be over the row bound are visible on A — the host's own mark and the render-time cap for a receipt this file did not mint", treeText(treeByClass(hostCutRow, "dshsl-send-rows-trunc")) !== "" && treeText(treeByClass(overCapRow, "dshsl-send-rows-trunc")) === "（已截断——仅显示前 24 行）" && treeText(treeByClass(overCapRow, "dshsl-send-rowhead")) === "✦ 工具调用 · team_link_send · 30 个目标");
+// The mark is core-opaque like the rest of `meta`, and it is a display
+// statement only: a shape this build cannot read is DROPPED (the card still
+// renders and the label falls back to the rows it actually has) — it must never
+// be able to put a non-number into the label or invent a note.
+const unreadableMarkRow = renderSendRow(sendBlock({ ...SEND_CARD, targets: hostCutTargets, targetsTruncated: { shown: "24", total: 30 }, summary: { delivered: 30, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 } }));
+check("U14 跨轮: an unreadable mark is dropped, not trusted (the label falls back to the rows it has, and no note is invented)", isSendCard(unreadableMarkRow) && treeText(treeByClass(unreadableMarkRow, "dshsl-send-rowhead")) === "✦ 工具调用 · team_link_send · 24 个目标" && treeByClass(unreadableMarkRow, "dshsl-send-rows-trunc") === null);
+// The number in 「仅显示前 N 行」 is the number of rows ACTUALLY drawn, never a
+// count the mark merely asserts: here a hand-edited `shown` says 5 while the
+// card draws 24, so 24 is what the sentence may state.
+const lyingMarkRow = renderSendRow(sendBlock({ ...SEND_CARD, targets: overCapTargets, targetsTruncated: { shown: 5, total: 30 }, summary: { delivered: 30, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 } }));
+check("U14 跨轮: ... the note counts the rows drawn, never a number the mark merely asserts", treeText(treeByClass(lyingMarkRow, "dshsl-send-rows-trunc")) === "（已截断——仅显示前 24 行）" && treeText(treeByClass(lyingMarkRow, "dshsl-send-rowhead")) === "✦ 工具调用 · team_link_send · 30 个目标");
+// 对照: the visible text of a card with NO mark and ≤ 24 rows is byte-for-byte
+// what it was before this round — no note, and the label is its own row count
+// (the two shapes the 评审 #2 block above already pins, restated here as the
+// control for the mark path).
+check("U14 跨轮 对照: a 3-target card and a no-mark 24-row card carry NO truncation note and label their own row count", treeByClass(cardRow, "dshsl-send-rows-trunc") === null && treeText(treeByClass(cardRow, "dshsl-send-rowhead")) === "✦ 工具调用 · team_link_send · 3 个目标" && treeByClass(atCapRow, "dshsl-send-rows-trunc") === null && treeText(treeByClass(atCapRow, "dshsl-send-rowhead")) === "✦ 工具调用 · team_link_send · 24 个目标");
+
 // ---------------------------------------------------------------------------
 // U15 (§10.1.3 D): this plugin's own Conversation Definition and the top-level
 // node it produces — matched on EXISTING tool/call + tool/result events only.

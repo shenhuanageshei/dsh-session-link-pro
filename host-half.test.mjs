@@ -1667,8 +1667,23 @@ check("U13: the model-visible text is untouched — the returned value is still 
 check("U13: ... and output.render still snapshots it as the single text block textOutput produced (same schema, same renderer)", sameJson(receiptEnv.send.output.render(receiptArgs, receiptText), [{ type: "text", text: receiptText }]));
 check("U13: the card carries the §10.1.2 discriminators and the sender identity", isCardShape(receiptCard) && receiptCard.senderSessionId === "session-self" && typeof receiptCard.at === "number" && receiptCard.at > 0 && receiptCard.fanout === false);
 check("U13: a single-target receipt has exactly one target row, with the id and the delivered outcome", receiptCard.targets.length === 1 && receiptCard.targets[0].sessionId === "session-worker-a" && receiptCard.targets[0].outcome === "delivered");
-check("U13: the row detail is the SAME sentence the text report prints — one source, two faces", receiptCard.targets[0].detail === receiptText);
+// B1 (差异审计): the row detail is the per-target result sentence — the same
+// source the text report prints — but the report may append a CALL-level note
+// ("注意：meta.ref 超过 16 字符…", see the U7 case above) that is not a per-target
+// result line and so is deliberately NOT copied into the row. The claim is
+// therefore "identical until the envelope note"; the boundary is pinned from
+// both sides right below.
+check("U13: the row detail is the SAME sentence the text report prints (identical while no envelope note is appended)", receiptCard.targets[0].detail === receiptText && !receiptText.includes("注意："));
 check("U13: a literal session id is not an addressing expression, so the row carries no expr", receiptCard.targets[0].expr === undefined);
+// B1's other side: with a truncated envelope ref the report grows a call-level
+// note, and the row must NOT — the note is not that target's result line, and the
+// fan-out path keeps it out of every row the same way (`report.lines.push`).
+const notedEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const notedArgs = { targetSessionId: "session-worker-a", message: "带长引用", meta: { ref: "r".repeat(17) } };
+const { value: notedText, card: notedCard } = await sendWithCard(notedEnv, notedArgs, execFor(notedEnv.senderAgent));
+check("B1: a truncated meta.ref appends its note to the TEXT report (the U7 behavior the card deliberately does not copy)", notedText.includes("注意：meta.ref 超过 16 字符（原 17 字符）"));
+check("B1: ... while the row detail stays the per-target sentence — the report's FIRST line, with the note left out", notedCard.targets[0].detail === notedText.split("\n")[0] && !notedCard.targets[0].detail.includes("注意：") && notedCard.targets[0].detail !== notedText);
+check("B1: ... and the truncated envelope itself still rides the card", sameJson(notedCard.meta, { ref: "r".repeat(16) }));
 check("U13: the summary counts the row kinds (delivered/refused/noAgent/noHolder/deduped)", sameJson(receiptCard.summary, { delivered: 1, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 }));
 check("U13: the body is carried in full when it is inside the cap (chars = code points, truncated false)", !receiptCard.message.truncated && receiptCard.message.chars === [..."裁决：走 A 方案"].length && receiptCard.message.text === "裁决：走 A 方案");
 check("U13: the envelope appears on the card exactly as normalized for the banner (§3.4 three keys only)", sameJson(receiptCard.meta, { type: "ruling", pri: "P0", ref: "slp-a1b2" }));
@@ -1719,6 +1734,45 @@ const poisonedArgs = { targetSessionId: "session-worker-a", message: poisonedBod
 const poisonedValue = await poisonedEnv.send.execute(poisonedArgs, execFor(poisonedEnv.senderAgent));
 const poisonedCard = poisonedEnv.send.output.presentationMeta(poisonedArgs, poisonedValue);
 check("U13: a lone surrogate inherited from the argument is repaired before it can be persisted", !hasLone(poisonedCard.message.text) && poisonedCard.message.chars === [...poisonedBody].length);
+
+// --- F2 (差异审计): every OTHER string member of the card ---------------------
+// `message.text` was the only member locked above. The card is persisted at
+// `tool/result.meta` and never passes `textOutput.render`, so each of its
+// strings needs its own gate AND its own lock: a lone surrogate anywhere in the
+// persisted meta fails the SENDER session's next model request with HTTP 400 —
+// permanently (the section header above). The model-visible text of the same
+// call is clean (it goes through `wellFormed` on return), which is exactly why
+// these cases are about the card and nothing else.
+/** The whole card as the log will hold it: every string member at once. */
+const cardHasLone = (card) => hasLone(JSON.stringify(card));
+
+// (a) a LITERAL session id: echoed straight from the caller's own argument.
+const poisonIdEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const poisonId = "session-\uD800target";
+const poisonIdArgs = { targetSessionId: poisonId, message: "x" };
+const poisonIdValue = await poisonIdEnv.send.execute(poisonIdArgs, execFor(poisonIdEnv.senderAgent));
+const poisonIdCard = poisonIdEnv.send.output.presentationMeta(poisonIdArgs, poisonIdValue);
+check("F2: a lone surrogate in a literal target id is repaired on the card (pre-fix: the card carried it while the text was clean)", isCardShape(poisonIdCard) && !cardHasLone(poisonIdCard) && poisonIdCard.targets[0].sessionId === "session-\uFFFDtarget");
+check("F2: ... and the model-visible text of that same call was already clean — the card was the only leaking path", !hasLone(poisonIdValue) && poisonIdValue.includes("session-\uFFFDtarget"));
+
+// (b) an ADDRESSING EXPRESSION: reaches the card as `expr` on the no-holder path
+//     (`fanout` stores the caller's expression verbatim for a row with no id).
+const poisonExprEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const poisonExpr = "team:night-shift/\uD800";
+const poisonExprArgs = { targets: [poisonExpr], message: "x" };
+const poisonExprValue = await poisonExprEnv.send.execute(poisonExprArgs, execFor(poisonExprEnv.senderAgent));
+const poisonExprCard = poisonExprEnv.send.output.presentationMeta(poisonExprArgs, poisonExprValue);
+check("F2: a lone surrogate in a team:<n>/<role> expression is repaired on the card (no-holder row)", isCardShape(poisonExprCard) && !cardHasLone(poisonExprCard) && poisonExprCard.targets[0].sessionId === null && poisonExprCard.targets[0].expr === "team:night-shift/\uFFFD");
+check("F2: ... while the same call's text report is clean too (both faces are gated, by different code)", !hasLone(poisonExprValue) && poisonExprCard.targets[0].outcome === "no-holder");
+
+// (c) the envelope: `ref` is caller text, and it is NOT a control character, so
+//     `readMeta`'s single-line check lets a lone surrogate through untouched.
+const poisonRefEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const poisonRefArgs = { targetSessionId: "session-worker-a", message: "x", meta: { ref: "slp-\uD800" } };
+const poisonRefValue = await poisonRefEnv.send.execute(poisonRefArgs, execFor(poisonRefEnv.senderAgent));
+const poisonRefCard = poisonRefEnv.send.output.presentationMeta(poisonRefArgs, poisonRefValue);
+check("F2: a lone surrogate in meta.ref is repaired on the card (the control-character check does not catch it)", isCardShape(poisonRefCard) && !cardHasLone(poisonRefCard) && poisonRefCard.meta.ref === "slp-\uFFFD");
+check("F2: the repaired envelope keeps its other two keys and the §3.4 shape", isCardShape(poisonRefCard) && Object.keys(poisonRefCard.meta).join(",") === "ref");
 
 // --- busy (§3.5) as a structured value -----------------------------------------
 const receiptBusyEnv = setup({

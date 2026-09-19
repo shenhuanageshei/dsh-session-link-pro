@@ -66,6 +66,7 @@ type TeamLinkSendCard = {
 		detail: string;                 // 一行摘要（与既有逐目标结果行同源）
 		busy?: { running: boolean; minutes?: number };   // busy 预判（读不到时间戳则只有 running）
 	}>;
+	targetsTruncated?: { shown: number; total: number };   // §10.1.2 行数界：**宿主裁过才有**；`total` 是真值总数，客户端标签据此显示真值，客户端的渲染期界是独立的第二道防御
 	summary: { delivered: number; refused: number; noAgent: number; noHolder: number; deduped: number };
 	fanout: boolean;                    // 单目标 vs fan-out（决定卡片布局）
 };

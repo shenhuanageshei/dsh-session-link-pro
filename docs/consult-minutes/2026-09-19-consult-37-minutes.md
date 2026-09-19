@@ -273,33 +273,33 @@ createAgent 走 `persistence.create(header)` 先落持久身份再发布（dsh-a
 
 | # | 来源 | 意见（要点） | 处置 | 理由 / 落点 |
 |---|---|---|---|---|
-| G1 | glm | A（toolview 卡片）确定可行、零风险（对自己工具是 additive） | **采纳** | 与 D2/D8 独立一致。落点：设计 §新-1-A |
-| G2 | glm | **D（客户端升格）是最佳主路径**：注册 conversation node definition，match 发送方已有的 `tool/call`+`tool/result`；chat 自家 6 个 def 就是 match log-only 事件，说明 `match(event)` 面对全事件流；unknown fallback 只认 append-surface 事件，不会撞出重复节点；`uiConversation` 是公开服务、`events.register` 是公开 registry（kind 须全局唯一、带前缀） | **采纳（本轮关键发现——推翻我上轮的 C 倾向）** | 落点：设计 §新-1-D |
-| G3 | glm | B 否决：自回环真实；且把审计混进模型上下文，违背本插件「给 worker 省上下文」的哲学 | **采纳** | 落点：设计 §新-1 取舍表 |
-| G4 | glm | C 的三层扩展点里**写入面是断的**：`Session.append` 的信封没有 `ignorable` 通道；KNOWN 清单由仓库内声明生成，外部插件的合并不进清单 ⇒ 现场写不报错、**下次 restore 整份日志被拒** | **采纳**（我逐行复核 `dsh-session/lib/index.js:1237-1255`：信封确为 `{type,seq,time,data,...surfaceMetadata}`，`surfaceMetadata` 只可能带 `sourceEventSeqs`/`surfaceOp`，**无 `ignorable`**） | 落点：设计 §新-1 取舍表 + 给上游的 feature request |
+| G1 | glm | A（toolview 卡片）确定可行、零风险（对自己工具是 additive） | **采纳** | 与 D2/D8 独立一致。落点：《协作增强设计》§10.1.1 |
+| G2 | glm | **D（客户端升格）是最佳主路径**：注册 conversation node definition，match 发送方已有的 `tool/call`+`tool/result`；chat 自家 6 个 def 就是 match log-only 事件，说明 `match(event)` 面对全事件流；unknown fallback 只认 append-surface 事件，不会撞出重复节点；`uiConversation` 是公开服务、`events.register` 是公开 registry（kind 须全局唯一、带前缀） | **采纳（本轮关键发现——推翻我上轮的 C 倾向）** | 落点：《协作增强设计》§10.1.3 |
+| G3 | glm | B 否决：自回环真实；且把审计混进模型上下文，违背本插件「给 worker 省上下文」的哲学 | **采纳** | 落点：《协作增强设计》§10.1 取舍表 |
+| G4 | glm | C 的三层扩展点里**写入面是断的**：`Session.append` 的信封没有 `ignorable` 通道；KNOWN 清单由仓库内声明生成，外部插件的合并不进清单 ⇒ 现场写不报错、**下次 restore 整份日志被拒** | **采纳**（我逐行复核 `dsh-session/lib/index.js:1237-1255`：信封确为 `{type,seq,time,data,...surfaceMetadata}`，`surfaceMetadata` 只可能带 `sourceEventSeqs`/`surfaceOp`，**无 `ignorable`**） | 落点：《协作增强设计》§10.1 取舍表 + 给上游的 feature request |
 | G5 | glm | 运行时 append **不校验**词表成员资格 ⇒ 失败被推迟到 restore（与 `kind:"team-link"` 事故同形） | **采纳** | 同上 |
-| G6 | glm | 官方先例存在但**不可搭车**：`dsh-experimental-agent-team` 的 `team/*` 事件正是「发送侧 log-only 协作记录」的第一方实现；外部插件直接 append = 伪造其状态机输入 | **采纳（作为禁令）** | 落点：设计 §新-1「不得伪造第一方事件」 |
+| G6 | glm | 官方先例存在但**不可搭车**：`dsh-experimental-agent-team` 的 `team/*` 事件正是「发送侧 log-only 协作记录」的第一方实现；外部插件直接 append = 伪造其状态机输入 | **采纳（作为禁令）** | 落点：《协作增强设计》§10.1「不得伪造第一方事件」 |
 | G7 | glm | B 的受控事实：发送方模型本来就看得见 tool 参数与结果，「模型知道自己发过什么」不是新增暴露 | **采纳** | 支撑 D：可见性补在客户端即最优 |
-| G8 | glm | A+D 风险面：正文要截断；kind 带前缀；同一消息两处出现（刻意）；客户端 def/registry 是较新公开面、有升级跟随成本（但比日志格式风险低一个数量级——坏了只是不渲染） | **采纳** | 落点：设计 §新-1 边界 |
-| G9 | glm | ② 根会话 = **全省略** `origin`/`parentSession`/`delegationDepth` 且无 `parentAgent`；header 运行时校验 `origin !== undefined && !== 'subagent'` 抛错 ⇒ `undefined` 是唯一合法的非子代理取值 | **采纳**（我另用 `dsh-webhook` 先例复核，见 D11） | 落点：设计 §新-2 |
-| G10 | glm | 「只听从主会话指挥」**不是 header 能表达的语义**，属 roster/policy 层（已有 `policy.writer`）；别用 `delegationDepth`/`origin` 编码指挥关系 | **采纳（重要设计修正）** | 落点：设计 §新-2「服从来自启动 prompt + roster，不来自会话血统」 |
-| G11 | glm | 启动任务：`create` resolve 之后 `followup`（**不要 `inject`**——那是「投递不唤醒」）；复用三成员 relay source；首条建议豁免接收确认门（同意权由命令确认框一次性授予），后续照常过双门 | **采纳** | 落点：设计 §新-2（豁免口径需在设计中写明） |
+| G8 | glm | A+D 风险面：正文要截断；kind 带前缀；同一消息两处出现（刻意）；客户端 def/registry 是较新公开面、有升级跟随成本（但比日志格式风险低一个数量级——坏了只是不渲染） | **采纳** | 落点：《协作增强设计》§10.1 边界 |
+| G9 | glm | ② 根会话 = **全省略** `origin`/`parentSession`/`delegationDepth` 且无 `parentAgent`；header 运行时校验 `origin !== undefined && !== 'subagent'` 抛错 ⇒ `undefined` 是唯一合法的非子代理取值 | **采纳**（我另用 `dsh-webhook` 先例复核，见 D11） | 落点：《协作增强设计》§10.2 |
+| G10 | glm | 「只听从主会话指挥」**不是 header 能表达的语义**，属 roster/policy 层（已有 `policy.writer`）；别用 `delegationDepth`/`origin` 编码指挥关系 | **采纳（重要设计修正）** | 落点：《协作增强设计》§10.2「服从来自启动 prompt + roster，不来自会话血统」 |
+| G11 | glm | 启动任务：`create` resolve 之后 `followup`（**不要 `inject`**——那是「投递不唤醒」）；复用三成员 relay source；首条建议豁免接收确认门（同意权由命令确认框一次性授予），后续照常过双门 | **采纳** | 落点：《协作增强设计》§10.2（豁免口径需在设计中写明） |
 | G12 | glm | 侧边栏可见/可打开：无 origin ⇒ 顶层列表项；**但**「点开一个已有 live agent 的会话是否复用实例」需真机点一次 | **采纳（转为 §5 待验项）** | §5 |
-| G13 | glm | 上限三层（命令硬顶 N≤8 对齐既有 fan-out ≤8／settings 默认 8 硬顶 16／roster 每队成员数上限）+ 确认框放**命令 handler 层**（复用 `userQuestions.ask` + `invocation.agent`） | **采纳** | 落点：设计 §新-2 |
-| G14 | glm | 坑（按严重度）：① **所有权/生命周期最大**——create 的事务挂在调用者 ctx 的 fiber，用命令 handler 的临时 ctx 会导致 handler 结束即拆 agent ⇒ 必须从**插件根 ctx** 创建并持有 handle；插件卸载=全队 teardown（会话在盘、agent 不在）⇒ 需恢复路径；② 部分失败：失败即停、已建者保留+报告、按 role 幂等；③ 孤儿：`pending-create` 意图 + TTL + 启动清扫；④ id 冲突；⑤ `cwd` 必须绝对 | **采纳**（①与 D12 的调和见 §3） | 落点：设计 §新-2 生命周期节 |
+| G13 | glm | 上限三层（命令硬顶 N≤8 对齐既有 fan-out ≤8／settings 默认 8 硬顶 16／roster 每队成员数上限）+ 确认框放**命令 handler 层**（复用 `userQuestions.ask` + `invocation.agent`） | **采纳** | 落点：《协作增强设计》§10.2 |
+| G14 | glm | 坑（按严重度）：① **所有权/生命周期最大**——create 的事务挂在调用者 ctx 的 fiber，用命令 handler 的临时 ctx 会导致 handler 结束即拆 agent ⇒ 必须从**插件根 ctx** 创建并持有 handle；插件卸载=全队 teardown（会话在盘、agent 不在）⇒ 需恢复路径；② 部分失败：失败即停、已建者保留+报告、按 role 幂等；③ 孤儿：`pending-create` 意图 + TTL + 启动清扫；④ id 冲突；⑤ `cwd` 必须绝对 | **采纳**（①与 D12 的调和见 §3） | 落点：《协作增强设计》§10.2 生命周期节 |
 | G15 | glm | 文档修正：代码里「本插件不能编程创建会话（V9 未验证）」现已可证伪 | **采纳** | 与 D11 合并落点 |
-| D1 | deepseek | ① 根因：客户端只注册了 `key:"context"`，**没有注册任何 `tool.call.toolview` 键** ⇒ 落回通用工具行（灰 ✦）。这是根因，不是渲染 bug | **采纳** | 落点：设计 §新-1 现状 |
-| D2 | deepseek | A 的渲染数据来自 `block: ToolCallBlock`（`call.name/argsRaw/content`、`meta?`） | **采纳** | 落点：设计 §新-1-A |
-| D3 | deepseek | **`tool/result.meta` 是官方耐久载体**（对核心不透明、工具自持形状、JSON 校验、durable 回放复现同一张卡），写入端是 `output.presentationMeta(args, value): JsonValue`；现在 `send` 用 `textOutput()`，应加 `presentationMeta` 输出**结构化逐目标回执** | **采纳**（我另复核 `dsh-tools/lib/types/schema.d.ts:192`、`presentation.d.ts:257`，以及第一方 `dsh-tool-fs-search` 的同类用法） | 落点：设计 §新-1 数据链 |
-| D4 | deepseek | D 可行：registry 按 **kind 唯一**、允许**多个 definition match 同一事件**各自发布自己的 location key（仅同 key 才拒）；chat 自家 `toolDefinition` 就是「match `tool/call`+`tool/result` → 顶层 `tool-call` 节点」 | **采纳** | 落点：设计 §新-1-D |
+| D1 | deepseek | ① 根因：客户端只注册了 `key:"context"`，**没有注册任何 `tool.call.toolview` 键** ⇒ 落回通用工具行（灰 ✦）。这是根因，不是渲染 bug | **采纳** | 落点：《协作增强设计》§10.1 现状 |
+| D2 | deepseek | A 的渲染数据来自 `block: ToolCallBlock`（`call.name/argsRaw/content`、`meta?`） | **采纳** | 落点：《协作增强设计》§10.1.1 |
+| D3 | deepseek | **`tool/result.meta` 是官方耐久载体**（对核心不透明、工具自持形状、JSON 校验、durable 回放复现同一张卡），写入端是 `output.presentationMeta(args, value): JsonValue`；现在 `send` 用 `textOutput()`，应加 `presentationMeta` 输出**结构化逐目标回执** | **采纳**（我另复核 `dsh-tools/lib/types/schema.d.ts:192`、`presentation.d.ts:257`，以及第一方 `dsh-tool-fs-search` 的同类用法） | 落点：《协作增强设计》§10.1 数据链 |
+| D4 | deepseek | D 可行：registry 按 **kind 唯一**、允许**多个 definition match 同一事件**各自发布自己的 location key（仅同 key 才拒）；chat 自家 `toolDefinition` 就是「match `tool/call`+`tool/result` → 顶层 `tool-call` 节点」 | **采纳** | 落点：《协作增强设计》§10.1.3 |
 | D5 | deepseek | B 自回环机制：`followup`/`steer`/`inject` 投递的都是 `user/message`，而 `user/message` 是 surface 事件、必然进模型 ⇒ **不存在**「顶层可见但不进模型」的 B | **采纳** | 落点：取舍表 |
 | D6 | deepseek | C 的失败不会在 append 现场暴露，而是推迟到持久化读路径 | **采纳**（与 G5 同源，独立复核一致） | 取舍表 |
-| D7 | deepseek | **纠正父代理的事实**：「Unknown events, **even ignorable ones** … are refused」是**迁移**文档的封闭清单措辞；实际规则是**保留**「未知但标了 `ignorable`」的事件，`ignorable` 正是官方为仓外插件事件设计的兼容机制（事件名注册被明确否决） | **采纳**（并据此修正我上轮的表述；与 G4 叠加后结论不变：机制在，但 **live write 无法打标**） | 落点：设计 §新-1 事实修正 |
+| D7 | deepseek | **纠正父代理的事实**：「Unknown events, **even ignorable ones** … are refused」是**迁移**文档的封闭清单措辞；实际规则是**保留**「未知但标了 `ignorable`」的事件，`ignorable` 正是官方为仓外插件事件设计的兼容机制（事件名注册被明确否决） | **采纳**（并据此修正我上轮的表述；与 G4 叠加后结论不变：机制在，但 **live write 无法打标**） | 落点：《协作增强设计》§10.1 事实修正 |
 | D8 | deepseek | 最终判定：A 最稳，顶层记录走 D 最稳 | **采纳** | 同 G1/G2 |
-| D9 | deepseek | 第五条路（给②用）：slash 命令本身会产生 `command/run`+`command/done` **已知 log-only 事件**，客户端有**原生 CommandNode 顶层行** ⇒ `/team_session` 免费获得顶层可见记录；另：把回执追加进黑板 `decisions.md` 作为审计留痕（不进日志、不进模型）；`presentResult` 的 generic 卡片是**封闭 union**，定制度不如 toolview | **采纳** | 落点：设计 §新-2（顶层可见的免费来源）+ §新-1（审计替代路径） |
-| D10 | deepseek | A+D 风险：toolview 键必须**精确等于**线上工具名；fan-out 一卡承载逐目标；D 需 client 新增 inject `"uiConversation"`；kind 全局唯一带前缀；`ChatNodeDataMap` 类型增广 + 同 kind 注册 `conversation.chat.node` 槽位（与 `key:"context"` 并存）；**窗口截断回退**（`tool/call` 滚出窗口只剩 `tool/result` 时按 `context.matches` 回退，照 chat 包 fallback 模式）；`chatNode`/`contextLocation` helper 形状公开但**需确认客户端模块系统能否 require 到 chat 包**；**重复渲染**（顶层摘要卡 + 树内明细卡，须让两者承载不同内容） | **采纳** | 落点：设计 §新-1 边界与验收 |
-| D11 | deepseek | ② 官方模板 = `dsh-webhook` 的 `createWebhookSession`；第二先例 = UI 自身的 `createOrAdopt`；`meta` 只放 `cwd`/`agentPreset` | **采纳**（我复核 `dsh-webhook/lib/index.js:90-134`：`sessionId` 自造带前缀、`meta` 无 origin、create resolve 后 `followup` 驱动首回合） | 落点：设计 §新-2 |
-| D12 | deepseek | webhook 文档原话「the Agent remains lifecycle-owned by `ctx` and follows normal Session behavior」⇒ 创建的 handle 可丢弃 | **采纳**（与 G14① 的调和见 §3） | 设计 §新-2 |
+| D9 | deepseek | 第五条路（给②用）：slash 命令本身会产生 `command/run`+`command/done` **已知 log-only 事件**，客户端有**原生 CommandNode 顶层行** ⇒ `/team_session` 免费获得顶层可见记录；另：把回执追加进黑板 `decisions.md` 作为审计留痕（不进日志、不进模型）；`presentResult` 的 generic 卡片是**封闭 union**，定制度不如 toolview | **采纳** | 落点：《协作增强设计》§10.2（顶层可见的免费来源）+ 《协作增强设计》§10.1（审计替代路径） |
+| D10 | deepseek | A+D 风险：toolview 键必须**精确等于**线上工具名；fan-out 一卡承载逐目标；D 需 client 新增 inject `"uiConversation"`；kind 全局唯一带前缀；`ChatNodeDataMap` 类型增广 + 同 kind 注册 `conversation.chat.node` 槽位（与 `key:"context"` 并存）；**窗口截断回退**（`tool/call` 滚出窗口只剩 `tool/result` 时按 `context.matches` 回退，照 chat 包 fallback 模式）；`chatNode`/`contextLocation` helper 形状公开但**需确认客户端模块系统能否 require 到 chat 包**；**重复渲染**（顶层摘要卡 + 树内明细卡，须让两者承载不同内容） | **采纳** | 落点：《协作增强设计》§10.1 边界与验收 |
+| D11 | deepseek | ② 官方模板 = `dsh-webhook` 的 `createWebhookSession`；第二先例 = UI 自身的 `createOrAdopt`；`meta` 只放 `cwd`/`agentPreset` | **采纳**（我复核 `dsh-webhook/lib/index.js:90-134`：`sessionId` 自造带前缀、`meta` 无 origin、create resolve 后 `followup` 驱动首回合） | 落点：《协作增强设计》§10.2 |
+| D12 | deepseek | webhook 文档原话「the Agent remains lifecycle-owned by `ctx` and follows normal Session behavior」⇒ 创建的 handle 可丢弃 | **采纳**（与 G14① 的调和见 §3） | 《协作增强设计》§10.2 |
 | F1 | kimi-k3 / codex-cli | 超时无内容 | **failed（不构成 pending）** | — |
 
 ## §3 分歧与父侧裁定（**主代理写**）

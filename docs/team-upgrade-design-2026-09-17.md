@@ -2,7 +2,7 @@
 
 > **文档用途**：本文档是 `team-upgrade-research-2026-09-17.md`（下称《调研》）§5 提案的实施级修正设计。对《调研》§7 议题的裁决、DSH 0.1.5 源码验证事实、会诊 #27 的意见处置记录在 §1.2 / §8。机制均带伪代码与 schema；验收标准对齐仓库既有测试形态（`host-half.test.mjs`）。
 >
-> **状态**：v1.4（2026-09-18 增补 §9「收尾修复设计」：settings seam 静默失效与建队引导自锁的修复、清单闭合、发布收尾；**§1–§4、§6、§8 保持 v1.3 原文不变，§5/§7 按 §9.4 增量**——v1.3 的设计评审 PASS 与 token d950e9c5…3209 记录为：10 条 advisory 全部折入：retire 语义 §3.3.2、tick 状态归属与自指拒绝 §3.2.4、pending 过期清扫与回退终态 §3.6.2、provisional 可见面三处 §3.6.2/§5.2、空缺寻址 §3.4、U2 补 dead 分支、数值上限 §4.1、P6 映射 §1.1、《调研》supersession 指针）。更名与 v1.2 沿革见 README「更名通告」。插件版本基线 0.3.0（rename 分支），DSH 0.1.5。
+> **状态**：v1.5（2026-09-19 增补 §10「协作增强两项设计」：发送方可见性 **A+D**（工具树卡片 + 客户端升格为顶层节点）、`/team_session` 自动建队；会诊 #37 的 25 条裁定落于 §10.7。**§1–§9 一字不动**，§10 只做增量）。v1.4（2026-09-18 增补 §9「收尾修复设计」：settings seam 静默失效与建队引导自锁的修复、清单闭合、发布收尾；**§1–§4、§6、§8 保持 v1.3 原文不变，§5/§7 按 §9.4 增量**——v1.3 的设计评审 PASS 与 token d950e9c5…3209 记录为：10 条 advisory 全部折入：retire 语义 §3.3.2、tick 状态归属与自指拒绝 §3.2.4、pending 过期清扫与回退终态 §3.6.2、provisional 可见面三处 §3.6.2/§5.2、空缺寻址 §3.4、U2 补 dead 分支、数值上限 §4.1、P6 映射 §1.1、《调研》supersession 指针）。更名与 v1.2 沿革见 README「更名通告」。插件版本基线 0.3.0（rename 分支），DSH 0.1.5。
 
 ---
 
@@ -738,3 +738,250 @@ function createPolicyStore(ctx) {
 | ④ 创建分支**无条件**认领（O8）+ 落点 `applyTeamUpsert`/`roleRecord`（O9） | 采纳 | §9.2.2 |
 | 测试 / README / §3.3.2 同步项（O10） | 采纳 | §9.2.2 同步项 |
 | 收尾顺序 ③→④→复跑→真机验证（O11） | 采纳 | §9.5 前置序 + §5.2 演练 7 |
+
+---
+
+## 10. 协作增强两项设计（2026-09-19，v1.5）
+
+> **本节定位**：① 发送方可见性（自己发出的跨会话消息在**发送方**会话里的呈现）；② `/team_session` 自动建队（一条命令建 N 个 worker 会话并登记进 roster）。会诊 #37 的逐条裁定与原始层见 `docs/consult-minutes/2026-09-19-consult-37-minutes.md`（**2/4 交付**，两条独立收敛）。**§1–§9 一字不动**，本节只做增量。
+
+### 10.0 现状与根因（先现象，后归因）
+
+| # | 现状（实测/截图取证） | 根因（已核实） |
+|---|---|---|
+| ① | 接收方的跨会话消息是**带左色条与底色的卡片**；而**发送方自己**只看到一行藏在可折叠工具树**第 3 级缩进**的灰色 `✦ 工具调用 · team_link_send · session-<id>`（无底色、无边框、可能被折叠而完全不在视线上） | 客户端半边只在 `conversation.chat.node` 的 **`key:"context"`** 上注册了卡片渲染器——那只覆盖**接收方日志里的 context 消息**；插件**从未注册 `tool.call.toolview` 键**，于是发送方的工具调用落回通用工具行。**这不是渲染 bug，是能力缺口** |
+| ② | 建队要人工开会话 → 复制深链 → 逐个登记；`lib/index.js` 的 prepare 文案至今写着「本插件不能编程创建会话（V9 未验证）」 | 插件零编程建会话实现；而该 API 在 0.1.5 **公开可用**（`ctx.agents.create` / `CreateAgentOptions`），该句**现已证伪**（§10.2.7 同批修正） |
+
+### 10.1 ① 发送方可见性：A + D
+
+**设计决定**：**A + D 组合**。A 让工具树里那一行本身变成卡片（**审计记录留在原位**）；D 让同一件事在会话流**顶层**再多一条可见记录。**B 与 C 明确不做**（理由见 §10.1.4）。
+
+#### 10.1.1 A：工具调用视图（`tool.call.toolview`）
+
+```js
+// client.js —— 按「线上工具名」接管工具调用渲染；键域开放、对自己工具是 additive
+ctx.slots.inject("tool.call.toolview", () => ctx.slots.register({
+	name: "tool.call.toolview",
+	key: "team_link_send",          // ⚠ 必须逐字等于线上工具名：typo = 静默回退通用行（无报错）
+	locale: "dsh-team-link"
+}, function SendToolCallView(props) {
+	// props.block: ToolCallBlock —— running 时是 { kind:'tool-call', call:{ name, argsRaw, content } }
+	//                             settled 时是 { kind:'tool-result', … , meta?: unknown }
+	// settled 且有 meta → 用结构化回执渲染卡片；无 meta → 回退到模型可见文本（降级）
+	var card = readSendCard(props.block);   // 见 §10.1.2；无法解析时返回 null
+	return React.createElement(card === null ? PlainRow : SendCard, { ...props, card: card });
+}));
+```
+
+#### 10.1.2 数据链：`presentationMeta`（官方结构化载体，不是 regex 解析）
+
+`team_link_send` 现在用 `output: textOutput()`，卡片只能靠解析返回文本——脆弱。改用官方载体：**`output.presentationMeta(args, value): JsonValue`**，其产物持久化在 `tool/result.meta` 里（对核心不透明、JSON 校验、**durable 回放能复现同一张卡**）。第一方先例：`dsh-tool-fs-search` 用它持久化结构化搜索结果，并对序列化体积设上限。
+
+```ts
+// tool/result.meta 的目标形状（本节定义；v 供未来演进分支）
+type TeamLinkSendCard = {
+	kind: "team-link-send";          // 自带判别符，避免与其它工具的 meta 混形
+	v: 1;
+	at: number;                       // 投递时刻（ms）
+	senderSessionId: string;          // 发送方（= 这条记录所在会话）
+	meta?: { type?: string; pri?: string; ref?: string };   // 信封（仅调用方给了才有）
+	message: { text: string; truncated: boolean; chars: number };  // 正文（设上限，见下）
+	targets: Array<{
+		expr?: string;                  // 若来自寻址表达式（team:<n>/<role>、team:<n>/*）
+		sessionId: string | null;       // 直达 id；no-holder 时 null
+		outcome: "delivered" | "refused" | "no-agent" | "no-holder";
+		detail: string;                 // 一行摘要（与既有逐目标结果行同源）
+		busy?: { running: boolean; minutes?: number };   // busy 预判（读不到时间戳则只有 running）
+	}>;
+	summary: { delivered: number; refused: number; noAgent: number; noHolder: number; deduped: number };
+	fanout: boolean;                    // 单目标 vs fan-out（决定卡片布局）
+};
+```
+
+**体积纪律**：`message.text` 设硬上限（超出则 `truncated: true` 且只存头尾），`targets` 上限对齐既有 fan-out ≤8。理由是 `dsh-tool-fs-search` 的同款做法——**持久化的卡片必须有界**，否则一份长消息会被原样烙进会话日志。
+
+#### 10.1.3 D：客户端升格为顶层可见节点
+
+原理：注册一个**自己的 conversation node definition**，`match` 命中发送方会话里**已有的** `tool/call`（`name === "team_link_send"`）与 `tool/result`，产出一个**顶层**节点；再用同 kind 的 `conversation.chat.node` 视图渲染成与接收方同款卡片。**不写任何日志事件，不动模型上下文。**
+
+```js
+// client.js
+const KIND = "team-link-send";        // 全局唯一，带插件前缀（registry 要求 uniquely named）
+ctx.inject(["uiConversation"], (c) => c.uiConversation.events.register({
+	kind: KIND,
+	match(event) { /* tool/call: data.name === "team_link_send"；tool/result: 按 callId 配对 */ },
+	// …按 chat 包自家 definition 的形状补全 buildLocationData / update…
+}));
+ctx.slots.inject("conversation.chat.node", () => ctx.slots.register({
+	name: "conversation.chat.node", key: KIND, priority: -90, locale: "dsh-team-link"
+}, TopLevelSendCard));                // 与接收方的 key:"context" 并存（kind 不同，不冲突）
+```
+
+**为什么可行（会诊两条独立确认 + 我复核）**：注册引擎按 **kind 唯一**，但**允许多个 definition 匹配同一事件**、各自发布自己的 location key（只有**同 key**才拒）；chat 包自己的 `toolDefinition` 正是「match `tool/call`+`tool/result` → 顶层 `tool-call` 节点」。`ChatNodeDataMap` 的注释原文即「**Public merge surface for Chat renderer payloads contributed by other plugins**」。
+
+#### 10.1.4 取舍：为什么不做 B / C
+
+| 方案 | 否决理由（都是源码级） |
+|---|---|
+| **B**：顶层 `inject` 一条消息 | `followup` / `steer` / `inject` 投递的都是 `user/message`，而 `user/message` 是 **surface 事件**、必然投影进模型上下文。也就是说**不存在**「顶层可见但不进模型」的 B；而且一条「来自自己」的消息会诱发自回环。**另注**：发送方模型本来就看得见 tool 参数与结果，所以「模型知道自己发过什么」并非新增暴露——可见性补在**客户端**才是正解 |
+| **C**：顶层 log-only 新事件 | 三层扩展点里**写入面是断的**：`Session.append` 构造事件信封时只放 `{type, seq, time, data, ...surfaceMetadata}`，`surfaceMetadata` 只可能带 `sourceEventSeqs`/`surfaceOp`——**没有任何途径打 `ignorable`**（已逐行复核 `dsh-session/lib/index.js:1237-1255`）；而 KNOWN 清单由**仓库内**声明生成，外部插件的接口合并不进清单。后果是**延迟引爆**：append 当场不报错（运行时**不校验**词表），下次 restore 才以「unknown event, not marked ignorable」**拒掉整本会话日志**——与历史 `kind:"team-link"` 事故同形 |
+| **搭车第一方事件** | `dsh-experimental-agent-team` 的 `team/*` 事件正是「发送侧 log-only 协作记录」的第一方实现，但外部插件直接 append = **伪造它的状态机输入**。**明令禁止** |
+
+> **事实修正（父侧自纠）**：本设计早前引用的「Unknown events, even ignorable ones … are refused」是 `dsh-session-format-v2-to-v3` **迁移**文档的封闭清单措辞；在 **restore/持久化读路径**上，「未知但标了 `ignorable`」的事件是**保留**的，`ignorable` 正是官方为仓外插件事件设计的兼容机制（事件名注册被明确否决）。**但这不改变 C 的结论**：没有 live-write API 能打该标记 ⇒ C 仍不可安全实施。已登记为**给上游的 feature request**（`append` 暴露 `ignorable`）。
+
+#### 10.1.5 边界与降级（A + D）
+
+- **键必须逐字等于线上工具名**（`team_link_send`）；写错了静默回退通用行、无任何报错——验收里要有「渲染确为卡片」的断言而不是「注册没报错」；
+- **窗口截断回退**：`tool/call` 滚出历史窗口、只剩 `tool/result` 时，按 `context.matches` 回退（照 chat 包自家 fallback 的模式）——否则顶层卡片会在长会话里消失；
+- **重复渲染是刻意的**：顶层卡片承载**摘要**（发给谁 / 结果 / 时间），工具树卡片承载**逐目标明细**。两者必须承载**不同**信息，避免同一信息出现两次；
+- **降级优先**：definition / registry 属较新的公开面；它们坏掉只应导致「不渲染」而**不得**影响会话（客户端失败不得炸 UI）；
+- **正文截断**：卡片正文按 §10.1.2 的上限截断并显式标注；
+- **不得引入新的日志事件类型**（见 §10.3 红线）。
+
+### 10.2 ② `/team_session` 自动建队
+
+**目标**：在协调者会话里一条命令 → 创建 N 个 **worker 根会话** → 每个被告知自己的角色与任务 → 全部登记进 roster。用户只需下指令。
+
+#### 10.2.1 命令契约与「顶层可见是免费的」
+
+```js
+ctx.commands.register({
+	name: "team_session",
+	input: { /* n / roles / model / preset / task / team —— 形状在实施时对齐 CommandInputDescriptor */ },
+	async handler(invocation) {
+		// 1) 解析参数 → 2) 上限检查（§10.2.4）→ 3) 一次性确认框（§10.2.4）
+		// 4) 逐个创建（§10.2.2）→ 5) create resolve 后投递启动任务（§10.2.3）
+		// 6) 登记 roster（按 role 幂等）→ 7) 汇总回报（含失败清单）
+	}
+});
+```
+
+**顶层可见是免费的**（会诊 D9）：命令本身会产生 `command/run` + `command/done` 两个**已知** log-only 事件，而客户端有**原生 CommandNode 顶层行**——`/team_session` 这条命令天然在会话里留下一条顶层可见记录，不需要额外造轮子。
+
+#### 10.2.2 创建根会话（模板 = `dsh-webhook` 的 `createWebhookSession`）
+
+```js
+const handle = await ctx.agents.create({          // ⚠ 必须从【插件根 ctx】创建，见 §10.2.5
+	sessionId: `team-link-${team}-${role}-${uuid8}`, // 自造、带前缀、避免 id 冲突
+	meta: { cwd: absoluteCwd, agentPreset: presetId },  // ⚠ 只放 cwd/agentPreset
+	//  ——— 血统字段一律【不写】：origin / parentSession / delegationDepth / parentAgent ———
+	agentOptions: resolved.agentOptions,
+	setup: async (agentCtx) => { /* 挂 preset / 初始模型选择（同 webhook 模板） */ }
+});
+```
+
+**为什么「全省略」就是根会话**：`meta.origin` 的类型是 `'subagent' | undefined`，且运行时校验 `origin !== undefined && origin !== 'subagent'` 抛错 ⇒ **`undefined` 是唯一合法的非子代理取值**；不写 `parentAgent` 即无父。两个官方先例（`dsh-webhook` 的 `createWebhookSession`、UI 自身的 `createOrAdopt`）都只放 `cwd`/`agentPreset`。
+
+#### 10.2.3 启动任务：`create` resolve 之后 `followup`
+
+```js
+await createAll();                               // 全部 create 完成（或失败即停，见 §10.2.6）
+handle.agent.followup(createUserMessage({
+	content: [{ type: "text", text: kickoffText }],
+	source: { kind: "agent-message", form: "relay", senderSessionId: coordinatorSessionId }
+}));                                             // ⚠ 恰好三成员（V10 红线）
+```
+
+规范原文是「**Setup composes, it never drives** — drive the agent only after creation resolves」，所以**先 create、后驱动**；且**不要用 `inject`**（那是「投递不唤醒」的上下文注入，启动任务需要驱动）。
+
+**首条的接收门口径（需在设计评审确认）**：新建 worker 的 `receiveMode` 默认 `ask`，若照走接收门，会在一个用户未必打开过的新会话里弹确认框。**两种可选设计**：
+
+- **(i) 预置配对**：确认框（§10.2.4）里**明确写出**「将为每个 worker 与主会话建立配对（双向免确认）」，用户勾选即视为一次性授权，插件据此写入 `pairs`；此后 worker 回报也免门。**代价**：信任授予从「接收方点配对」变成「命令发起方一次授权」——必须写在确认框正文里，不能默默发生。
+- **(ii) 不预置**：首条照走接收门，用户在每个新会话里点一次「配对」。**代价**：回到人工 N 次点击，与本节目标相抵。
+
+**本节取 (i)**，并把确认框正文作为该项授权的记录。
+
+#### 10.2.4 上限与授权（三层 + 一个框）
+
+| 层 | 上限 | 理由 |
+|---|---|---|
+| 命令语法硬顶 | **N ≤ 8** | 与既有 fan-out ≤8 同一约定，用户已有直觉 |
+| settings 可调 | 默认 8 / **硬顶 16** | 给「想开更多」留口子，但不放开到无限 |
+| roster 成员数 | 每 team 成员总数上限 | 防「多次命令 + 手动加人」累计突破 |
+
+**确认框**放**命令 handler 层**（不是工具层）：`CommandInvocation` 带确切的 `agent`，复用插件已在 `send` 里用的同一 `ctx.get("userQuestions").ask({ ..., agent: invocation.agent })`。框内必须写明：**将创建几个会话、每个用什么模型/预设、cwd、保守成本口径、以及（若取 (i)）将建立哪些配对**。命令本身是人类指令，门 1 天然满足；这个框补的是**批量爆炸半径的知情**。
+
+#### 10.2.5 生命周期与恢复（本节最大的坑）
+
+- **必须从插件根 ctx 创建**，并**由插件持有全部 `AgentHandle`**。用命令 handler 的**临时 ctx** 创建 → handler 结束可能连带拆掉刚建的 agent（会诊 G14①）。归属表述的另一半（会诊 D12）：`dsh-webhook` 文档写明「the Agent remains lifecycle-owned by `ctx` and follows normal Session behavior」——两者一致：**agent 属于你创建它时用的那个 ctx**。
+- **显式代价**：插件卸载/重载 = **全队 teardown**（会话仍在盘上，agent 不在）。这不是事故，是生命周期事实，必须写进文档并给出恢复路径：
+  - roster 把「盘上有会话但无活代理」如实标 **dead**（对齐公理 A4）；
+  - 插件重载后提供**收编/恢复引导**（提示可在侧边栏逐个打开把会话拉回来，再按 roster 重新登记）；
+  - 巡检面（`list_sessions`）已有的 `dead` 判定天然覆盖该状态，不新增机制。
+
+#### 10.2.6 失败与孤儿
+
+- **部分失败：失败即停**（第 k 个 create 失败），**已建者保留**并如实报告清单——不静默回滚（回滚会删掉可能已被用户看到的会话）；
+- **按 role 幂等**：同 team 同 role 已存在则跳过（命令可安全重试）；
+- **孤儿防护**：先写 `pending-create` 意图（含 TTL）到 roster，成功回填、失败或超时由插件启动时的清扫报告「可收编清单」；
+- **并发**：create 与 followup 串行（或 ≤2）——N 个 agent 同时首回合 = 成本峰值；
+- **cwd 必须绝对路径**（会话边界会校验）。
+
+#### 10.2.7 与 roster / policy 的关系，以及文档漂移修正
+
+**「只听从主会话指挥」不是会话 header 能表达的语义**（会诊 G10）。worker 的「服从」来自两处：**启动 prompt 的职责说明** + **roster 的写权限**（既有 `policy.writer` 机制）。**不得**用 `delegationDepth` / `origin` 去编码指挥关系——那是血统字段，不是权限字段。
+
+**同批修正文档漂移**：`lib/index.js` 的 prepare 文案（「本插件不能编程创建会话（V9 未验证）」）与 §3.6.4 的半自动兜底描述一并更新为「`agents.create` 公开可用；ownership 语义见 §10.2.5」。
+
+### 10.3 边界与防偏离（新增红线，接 §4 / §9.3）
+
+- **不得引入新的会话日志事件类型**（§10.1.4 C 的教训）：客户端可见性一律走「match 既有事件 + 客户端节点」；
+- **不得伪造第一方事件**（`team/*` 等仓库内包的领地）；
+- **批量动作必须有一处人类确认**，且确认框必须写明**数量、模型、cwd、成本口径与将建立的信任**；
+- **客户端失败不得影响会话**：definition/registry 坏了只应「不渲染」；
+- 既有的 `inject` 数组（4 项）、schema、投递门、`source` 三成员语义**均不改**；
+- ② 创建的会话**不得**标 `origin: 'subagent'`（用户明确要求：算根会话）。
+
+### 10.4 验收增量
+
+| # | 断言 | 覆盖 |
+|---|---|---|
+| U13 | `presentationMeta` 形状：逐目标 outcome/summary 与返回文本一致；**正文超限被截断且标注**；`targets` 上限对齐 fan-out ≤8 | §10.1.2 |
+| U14 | 客户端 A：注册 `key:"team_link_send"` 后渲染为卡片；**无 meta 时回退纯文本**；键写错时回退通用行（不抛错） | §10.1.1 |
+| U15 | 客户端 D：definition match 到 tool/call+tool/result；**顶层节点产出**；与接收方 `key:"context"` 并存不冲突；`tool/call` 缺位时按回退路径仍出节点 | §10.1.3 |
+| U16 | ② 参数与上限：N>8 拒绝、settings 硬顶 16 生效、roster 成员上限生效；确认框取消 → **零创建** | §10.2.4 |
+| U17 | ② 幂等与失败：同 role 已存在则跳过；第 k 个 create 失败 → 已建者保留 + 报告清单 + 失败即停 | §10.2.6 |
+| U18 | ② 血统与生命周期：新建会话 `meta` **不含** origin/parentSession/delegationDepth/parentAgent；handle 由插件持有；`pending-create` 超时被清扫并进「可收编清单」 | §10.2.2 / §10.2.5 / §10.2.6 |
+| U19 | 红线回归：整个 ①/② **不产生任何新的日志事件类型**；`source` 仍恰三成员；既有断言零回归 | §10.3 |
+
+**集成演练**：
+
+- **演练 8（①）**：真机发一条跨会话消息 → 发送方**工具树内是卡片**且**顶层多一条摘要卡**；`team_link_export` 的 md/JSON 与改动前**逐字一致**（证明零日志改动）；发送方**下一回合的模型上下文无任何新增消息**；
+- **演练 9（②）**：`/team_session` 建 2 个 worker → 侧边栏**顶层可见**、可打开、可被 `team_link_send` 寻址 → 各 worker 收到启动任务并回报 → 插件重载后 roster 正确标 **dead**、盘上会话可被重新打开收编。
+
+### 10.5 显式假设与待验项（不当作已知事实）
+
+- **H1**：编程创建的会话在 web 壳里「点开」时**复用** agents store 里的既有 live agent 实例（而非另行 resume 撞上单写者拒绝）。**验证步骤**：`/team_session` 建 1 个 → 在侧边栏点开它 → 观察是否出现错误或第二个实例。**失败回退**：若壳层试图 resume，改由插件在创建后即 attachSession 并在文档里写明「新会话需在侧边栏打开一次」。
+- **H2**：外部客户端 bundle 能 `require` 到 chat 包的 `chatNode` / `contextLocation` helper，且 `ctx.uiConversation.events.register` 接受**外部** definition。**验证步骤**：注册一个最小 definition，观察顶层节点是否出现。**失败回退**：按公开形状手工构造节点字面量（会诊 D10 给出的退路）。
+- 客户端 def/registry 属较新公开面，**升级有跟随成本**——按「坏了只是不渲染」定级，不进红线。
+
+### 10.6 本节明确不做（范围声明）
+
+- **不做 C**（新日志事件）——转上游 feature request，理由与证据见 §10.1.4；
+- **不做 B**（顶层 inject）——自回环 + 污染模型上下文；
+- **不做批量换届**——③ 保持逐角色（错峰是刻意约束）；
+- **不做 `presentResult` 的通用卡片**——官方词汇但 union 封闭，定制度不如 `tool.call.toolview`。
+
+### 10.7 会诊 #37 意见处置
+
+会诊 #37（4 模型并行只读，2026-09-19）：**2/4 交付**（glm-5.3 / deepseek-v4-pro，两条均为源码级完整答案且独立收敛；kimi-k3 / codex-cli:gpt-6-astra 超时无内容）。逐条裁定见 `docs/consult-minutes/2026-09-19-consult-37-minutes.md` §2（**25 条：24 采纳 / 1 failed**），分歧与父侧裁定见其 §3。
+
+对本文的落点：
+
+| 会诊要点 | 处置 | 落点 |
+|---|---|---|
+| A（toolview）确定可行、零风险（G1/D2/D8） | 采纳 | §10.1.1 |
+| **D 是最佳主路径**（G2/D4） | 采纳（**推翻父侧上轮的 C 倾向**） | §10.1.3 |
+| C 的写入面断点（G4/G5/D6）+ `ignorable` 的适用域修正（D7） | 采纳 + **父侧自纠一处事实** | §10.1.4 与其事实修正段 |
+| B 否决（自回环 + 污染上下文）（G3/D5） | 采纳 | §10.1.4 |
+| 不得伪造第一方事件（G6） | 采纳（升为红线） | §10.3 |
+| `tool/result.meta` + `presentationMeta` 官方载体（D3） | 采纳 | §10.1.2 |
+| slash 命令自带原生顶层行（D9） | 采纳 | §10.2.1 |
+| 根会话 = 全省略血统字段（G9/D11） | 采纳 | §10.2.2 |
+| 「服从」不靠血统（G10） | 采纳（重要修正） | §10.2.7 |
+| 启动任务 = create 后 followup、不用 inject（G11） | 采纳 | §10.2.3 |
+| 三层上限 + 命令层确认框（G13） | 采纳 | §10.2.4 |
+| 所有权/生命周期 + 恢复路径（G14①/D12） | 采纳（调和见纪要 §3(b)） | §10.2.5 |
+| 失败即停 / 幂等 / 孤儿防护（G14②③④⑤） | 采纳 | §10.2.6 |
+| 文档漂移（G15/D11） | 采纳 | §10.2.7 末段 |
+| 两条 failed（kimi / codex） | 无内容可处置 | 纪要 §2 F1 |

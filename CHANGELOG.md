@@ -6,6 +6,35 @@
 
 ---
 
+## 未发布 — 发送方可见性（设计 §10.1 A+D）
+
+> 让**发送方自己**也看到自己发出的跨会话消息卡片（此前只有接收方有卡片，发送方只看到一行藏在可折叠工具树里的灰字）。设计与裁决记录：`docs/collab-enhancements-design-2026-09-19.md` §10.1、`docs/consult-minutes/2026-09-19-consult-37-minutes.md`。
+>
+> **未发布状态**：宿主半边需 DSH 重启才在真机生效，演练 8（真机验收）**尚未执行**。
+
+### ✨ 新增
+- **A：`tool.call.toolview`（key 逐字 `team_link_send`）**——发送方的工具行从通用灰行变成与接收方同款的出站卡片（逐目标 outcome / detail / busy）。
+- **D：自有 conversation node definition（kind `team-link-send`）+ 顶层摘要卡**——在会话流**顶层**多一条「发给谁 / 正文 / 汇总计数 / 时间」。**不写任何日志事件、不动模型上下文**。
+- **数据链：`output.presentationMeta` → `tool/result.meta`**——卡片读**结构化回执**，不再 regex 解析工具返回文本；持久化后可回放重建同一张卡。
+
+### 🔧 修复（差异审计与代码评审发现）
+- **F2（仓库自身良构红线）**：`targets[].sessionId` / `expr` / `senderSessionId` / 信封 `type|pri|ref` **未经 `wellFormed`**——会把孤立代理项写进会话日志。已全部过闸 + 6 条回归锁（此前代码注释与 README 的「永远良构」自述**不成立**，已改）。
+- **F1**：A/D 两面曾逐字重复 head/body/summary/foot。已按「每块信息只准出现一次」分工（D = 标题+时间+正文+汇总；A = 标签+逐目标行）。
+- **F3**：客户端**模块级** inject 新增 `uiConversation`，会把设计承诺的「只不渲染」放大成「整个客户端半边不加载」。已改回 3 项 + 动态注入。
+- **B3 / 评审 #3**：四条客户端注册全部过 `guardedSlot`（一条抛错不影响其余）。
+- **评审 #1**：文件头注释曾称空闲目标「queued without being woken (inject)」，实际是 `followup`；已改。
+- **评审 #2**：客户端对 `targets` 行数设界（24）+ 显式截断标注（宿主侧同源缺口见下）。
+
+### ⚠️ 遗留（未随本轮修复）
+- **宿主侧 `buildSendCard` 的 `targets` 行数仍无上限**：`team:<n>/*` 通配可展开出全队成员的合法行，越过输入侧的 ≤8。设计 §10.1.2 已把「行数有界」定为契约，宿主侧待补（客户端已先有防御性上限）。
+
+### 🧪 验证
+- `node host-half.test.mjs` → `552 (failed: 0)`；`node client-half.test.mjs` → `130 (failed: 0)`（本轮前基线 506 / 46）。
+- 变异证据（单点回退，修复前必红）：正文截断去掉 → 5 红；结构化 busy 去掉 → 3 红；槽位 key 改近形 → 3 红；不读回执 → 12 红；窗口截断回退去掉 → 2 红；**F2** 的 `sessionId` / `expr` 孤立代理项 → 各 1 红；**评审 #2** 渲染上限去掉 → 2 红；**评审 #3** header 注册去掉护栏 → 2 红。
+- 真机未验证：宿主侧改动需 DSH 重启生效。
+
+---
+
 ## 0.3.7 — 2026-09-18（当前版本）
 
 > 收尾修复轮。修两个在**真实部署中实测到**的功能性阻塞，并收掉一轮代码评审的分歧。设计与裁决记录：`docs/team-upgrade-design-2026-09-17.md` §9、`docs/consult-minutes/2026-09-18-consult-36-minutes.md`。

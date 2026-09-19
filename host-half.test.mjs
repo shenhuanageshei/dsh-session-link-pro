@@ -1843,8 +1843,72 @@ const eightCardEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
 const eightCardArgs = { targets: ["session-worker-a", ...Array.from({ length: 7 }, (_, index) => `session-y${index}`)], message: "x" };
 const eightCardValue = await eightCardEnv.send.execute(eightCardArgs, execFor(eightCardEnv.senderAgent));
 const eightCard = eightCardEnv.send.output.presentationMeta(eightCardArgs, eightCardValue);
-check("U13: the card's targets bound IS the fan-out bound (≤8), never more", eightCard.targets.length === 8 && eightCard.targets.length <= 8);
+check("U13: 8 expressions resolve to 8 rows here — the ≤8 fan-out bound counts EXPRESSIONS; the card's own ROW bound is 24 (locked in the block below)", eightCard.targets.length === 8 && !Object.prototype.hasOwnProperty.call(eightCard, "targetsTruncated"));
 check("U13: the card is lossless JSON, which is what the registry requires before it persists it as tool/result.meta", sameJson(JSON.parse(JSON.stringify(holderCard)), holderCard) && sameJson(JSON.parse(JSON.stringify(fanCard)), fanCard));
+
+// --- U13 (§10.1.2 2026-09-19 修正): the card's ROW bound is 24, not the ≤8 -----
+// The bound locked just above counts the INPUT expressions. ONE `team:<name>/*`
+// is one expression and expands to every filled live member, so a legal broadcast
+// can carry more rows than 8 — and the array that is persisted as
+// `tool/result.meta` is the card's, which is why the ROW bound has to live here.
+// Same discipline as the body's 2000/1500+3+400: 有界呈现 + 如实标注 — the cut is
+// stated on the card, the summary still counts the whole set, and the
+// model-visible report keeps one row per target (the card is a bounded VIEW, the
+// report is the full archive).
+/** The card's members BEFORE the row bound, in their original order: a ≤24-row
+ * receipt must keep that shape key for key (the bound adds a member only to a
+ * card it actually cut). */
+const PRE_CAP_CARD_KEYS = "kind,v,at,senderSessionId,message,targets,summary,fanout";
+
+/** §3.4 fixture whose wildcard expansion is `memberCount` rows: the caller is the
+ * incumbent coordinator (the wildcard's own gate), and each worker is a filled
+ * live role AND paired with the caller, so every row is a real delivery rather
+ * than a refusal the test would have to explain. */
+function wideFanEnv(memberCount) {
+	const roles = [{ role: "coordinator", current: "session-self", pending: null, history: [{ session: "session-self", from: 1, until: null }] }];
+	const extraAgents = [];
+	const pairs = [];
+	for (let index = 0; index < memberCount; index += 1) {
+		const id = `session-w${String(index).padStart(2, "0")}`;
+		roles.push({ role: `w${index}`, current: id, pending: null, history: [{ session: id, from: 1, until: null }] });
+		extraAgents.push({ id, status: "idle" });
+		pairs.push(pairSelf(id));
+	}
+	const env = teamEnv({
+		teams: [{ name: "night-shift", createdAt: 1_700_000_000_000, workspace: TEAM_WS, policy: { writer: "coordinator" }, roles }],
+		extraAgents,
+	});
+	env.ns.data.pairs = structuredClone(pairs);
+	env.send = env.tool("team_link_send");
+	return env;
+}
+
+/** The report's own per-target rows, in order (the full archive). */
+const reportRows = (text) => text.split("\n").filter((line) => line.startsWith("- "));
+
+const wideEnv = wideFanEnv(30);
+const wideArgs = { targets: ["team:night-shift/*"], message: "全队通知：接口地址已切到 v2" };
+const wideValue = await wideEnv.send.execute(wideArgs, execFor(wideEnv.senderAgent));
+const wideCard = wideEnv.send.output.presentationMeta(wideArgs, wideValue);
+check("U13 行数界: one wildcard expression legally expands past the ≤8 expression bound — 30 targets, one report row each", wideEnv.extraCalls.size === 30 && reportRows(wideValue).length === 30);
+check("U13 行数界: a >24-row receipt is CUT to exactly 24 rows on the card (pre-fix: all 30 rows were welded into tool/result.meta)", wideCard.targets.length === 24);
+check("U13 行数界: ... and the card says so itself — the shown/total facts the client's `sendRowsTruncated`「已截断——仅显示前 {shown} 行」 wording needs", sameJson(wideCard.targetsTruncated, { shown: 24, total: 30 }));
+check("U13 行数界: the kept rows are the report's own FIRST 24 in order — a prefix of the archive, never a re-sorted sample", wideCard.targets.every((target, index) => reportRows(wideValue)[index] === `- ${target.sessionId}（via ${target.expr}） → ${target.outcome}：${target.detail}`));
+check("U13 行数界: the summary still counts the FULL set — the cut costs rows, never a count", sameJson(wideCard.summary, { delivered: 30, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 }));
+check("U13 行数界: the model-visible report keeps one row per target plus the full summary line (card = bounded view, report = full archive)", reportRows(wideValue).length === 30 && wideValue.startsWith("广播 fan-out：30 个目标\n") && wideValue.trimEnd().endsWith("汇总：30 投递 / 0 拒绝。"));
+check("U13 行数界: all 30 targets really received the message — the cut is presentation only", [...wideEnv.extraCalls.values()].every((calls) => calls.followedup.length === 1));
+check("U13 行数界: the cut rides immediately after the array it describes", Object.keys(wideCard).join(",") === "kind,v,at,senderSessionId,message,targets,targetsTruncated,summary,fanout");
+check("U13 行数界: the truncated card is still lossless JSON (what the registry requires before persisting it)", sameJson(JSON.parse(JSON.stringify(wideCard)), wideCard));
+
+// 对照 1: exactly 24 rows is INSIDE the bound — inclusive, like the
+// 2000-code-point body cap: no cut, no member, no report change.
+const at24Env = wideFanEnv(24);
+const at24Args = { targets: ["team:night-shift/*"], message: "全队通知" };
+const at24Value = await at24Env.send.execute(at24Args, execFor(at24Env.senderAgent));
+const at24Card = at24Env.send.output.presentationMeta(at24Args, at24Value);
+check("U13 行数界 对照: exactly 24 rows is NOT truncated — the cap is inclusive", at24Card.targets.length === 24 && !Object.prototype.hasOwnProperty.call(at24Card, "targetsTruncated"));
+check("U13 行数界 对照: a ≤24-row card gains NO member at all — the pre-bound shape, key for key (the 2-row fixture asserts the same)", Object.keys(at24Card).join(",") === PRE_CAP_CARD_KEYS && Object.keys(fanCard).join(",") === PRE_CAP_CARD_KEYS);
+check("U13 行数界 对照: ... and its counts and report rows are the same 24, with nothing else touched", sameJson(at24Card.summary, { delivered: 24, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 }) && reportRows(at24Value).length === 24);
 
 // ---------------------------------------------------------------------------
 // M4 (§3.6): rotation — two-phase hand-over, domain-limited migration, TTL rollback

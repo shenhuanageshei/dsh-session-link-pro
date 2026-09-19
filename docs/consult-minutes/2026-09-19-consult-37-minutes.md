@@ -296,7 +296,7 @@ createAgent 走 `persistence.create(header)` 先落持久身份再发布（dsh-a
 | D6 | deepseek | C 的失败不会在 append 现场暴露，而是推迟到持久化读路径 | **采纳**（与 G5 同源，独立复核一致） | 取舍表 |
 | D7 | deepseek | **纠正父代理的事实**：「Unknown events, **even ignorable ones** … are refused」是**迁移**文档的封闭清单措辞；实际规则是**保留**「未知但标了 `ignorable`」的事件，`ignorable` 正是官方为仓外插件事件设计的兼容机制（事件名注册被明确否决） | **采纳**（并据此修正我上轮的表述；与 G4 叠加后结论不变：机制在，但 **live write 无法打标**） | 落点：《协作增强设计》§10.1 事实修正 |
 | D8 | deepseek | 最终判定：A 最稳，顶层记录走 D 最稳 | **采纳** | 同 G1/G2 |
-| D9 | deepseek | 第五条路（给②用）：slash 命令本身会产生 `command/run`+`command/done` **已知 log-only 事件**，客户端有**原生 CommandNode 顶层行** ⇒ `/team_session` 免费获得顶层可见记录；另：把回执追加进黑板 `decisions.md` 作为审计留痕（不进日志、不进模型）；`presentResult` 的 generic 卡片是**封闭 union**，定制度不如 toolview | **采纳** | 落点：《协作增强设计》§10.2（顶层可见的免费来源）+ 《协作增强设计》§10.1（审计替代路径） |
+| D9 | deepseek | 第五条路（给②用）：slash 命令本身会产生 `command/run`+`command/done` **已知 log-only 事件**，客户端有**原生 CommandNode 顶层行** ⇒ `/team_session` 免费获得顶层可见记录；另：把回执追加进黑板 `decisions.md` 作为审计留痕（不进日志、不进模型）；`presentResult` 的 generic 卡片是**封闭 union**，定制度不如 toolview | **采纳（`decisions.md` 审计子项未采纳）** | 落点：《协作增强设计》§10.2（顶层可见的免费来源）。**审计子项未采纳**：① 的审计已由工具树卡片承担、换届的审计由 §11.4.3 交接文档承担；已在 §10.1.5 显式声明「未采纳」（设计评审判 #6 要求对齐） |
 | D10 | deepseek | A+D 风险：toolview 键必须**精确等于**线上工具名；fan-out 一卡承载逐目标；D 需 client 新增 inject `"uiConversation"`；kind 全局唯一带前缀；`ChatNodeDataMap` 类型增广 + 同 kind 注册 `conversation.chat.node` 槽位（与 `key:"context"` 并存）；**窗口截断回退**（`tool/call` 滚出窗口只剩 `tool/result` 时按 `context.matches` 回退，照 chat 包 fallback 模式）；`chatNode`/`contextLocation` helper 形状公开但**需确认客户端模块系统能否 require 到 chat 包**；**重复渲染**（顶层摘要卡 + 树内明细卡，须让两者承载不同内容） | **采纳** | 落点：《协作增强设计》§10.1 边界与验收 |
 | D11 | deepseek | ② 官方模板 = `dsh-webhook` 的 `createWebhookSession`；第二先例 = UI 自身的 `createOrAdopt`；`meta` 只放 `cwd`/`agentPreset` | **采纳**（我复核 `dsh-webhook/lib/index.js:90-134`：`sessionId` 自造带前缀、`meta` 无 origin、create resolve 后 `followup` 驱动首回合） | 落点：《协作增强设计》§10.2 |
 | D12 | deepseek | webhook 文档原话「the Agent remains lifecycle-owned by `ctx` and follows normal Session behavior」⇒ 创建的 handle 可丢弃 | **采纳**（与 G14① 的调和见 §3） | 《协作增强设计》§10.2 |
@@ -333,4 +333,5 @@ createAgent 走 `persistence.create(header)` 先落持久身份再发布（dsh-a
 | 日期 | 变更 |
 |---|---|
 | 2026-09-19 | 机制落盘（§0 汇总 + §1 原始层）；裁定层待主代理补写 |
-| 2026-09-19 | 父代理补写裁定层 §2–§5（25 条处置：24 采纳 / 1 failed；另修正父代理上轮一处事实表述）；结论：① 走 A+D（C 因写入面断点被否决并转上游 feature request）· ② 用官省血统字段拿根会话 + followup 驱动 + 三层上限 + 命令层确认框 |
+| 2026-09-19 | 父代理补写裁定层 §2–§5（**28 行处置：27 采纳 / 1 failed**；另修正父代理上轮一处事实表述）；结论：① 走 A+D（C 因写入面断点被否决并转上游 feature request）· ② 用全省略血统字段拿根会话 + followup 驱动 + 两层上限常量 + 命令层确认框 |
+| 2026-09-19 | 设计评审（advisor type=design，v1.5 §10/§11）PASS，9 条 advisory 已折入：演练 8 判据重写（§10.4）、体积与成员上限给出具体值（§10.1.2/§10.2.4）、预置配对的验收断言（U16）、既有 team 的 `writerGate` 说明（§10.2.4）、**本文件与设计文档的处置计数按实修正为 28/27**、D9 审计子项标注未采纳、新增 H4（工厂注册未验证）、交接文档发现路径（§11.4.3） |

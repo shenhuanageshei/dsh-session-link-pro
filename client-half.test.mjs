@@ -452,6 +452,29 @@ check("U14: the reader is total — it never throws for any of these shapes", ma
 	}
 }));
 
+// --- the receipt's row bound (round-1 🔵 #2) ---------------------------------
+// `meta` is CORE-OPAQUE and persisted, so a hand-edited log or a heterogeneous
+// implementation can carry any number of `targets`, and A draws one row per
+// entry — an unbounded transcript row. The bound cannot be the host's fan-out
+// cap of 8 EXPRESSIONS: `resolveTargetList` caps the input list, but ONE
+// `team:<name>/*` entry expands to every filled live role (`resolveTargets`) and
+// `buildSendCard` copies every resolved row without a cap, so a legal broadcast
+// can exceed 8 rows — refusing those outright would degrade a real card. The row
+// count is therefore bounded at render time (option (b) of the review) and the
+// truncation is stated on A, which is the face that owns the rows.
+const overCapTargets = Array.from({ length: 30 }, (_, i) => ({ sessionId: `session-worker-${i}`, outcome: "delivered", detail: `已投递到 session-worker-${i}` }));
+const overCapCard = { ...SEND_CARD, targets: overCapTargets, summary: { delivered: 30, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 } };
+const overCapRow = renderSendRow(sendBlock(overCapCard));
+check("评审 #2: a receipt with MORE targets than the row cap still renders as a card — the send is not thrown away for being large", isSendCard(overCapRow));
+check("评审 #2: ... but A draws a BOUNDED number of rows, not one per target", treeAllByClass(overCapRow, "dshsl-send-target").length === 24 && overCapTargets.length === 30);
+check("评审 #2: ... and the truncation is stated on the card, explicitly", treeText(treeByClass(overCapRow, "dshsl-send-rows-trunc")) === "（已截断——仅显示前 24 行）");
+check("评审 #2: ... while the label still states the TRUE target count (the bound hides rows, not the total)", treeText(treeByClass(overCapRow, "dshsl-send-rowhead")) === "✦ 工具调用 · team_link_send · 30 个目标");
+const overCapTop = renderTopCard(overCapCard);
+check("评审 #2: ... and D renders the same receipt with no truncation note (the note belongs to A, the row-owning face)", overCapTop !== null && treeByClass(overCapTop, "dshsl-relay dshsl-send").props["data-slp-send"] === "top" && treeByClass(overCapTop, "dshsl-send-rows-trunc") === null && treeText(treeByClass(overCapTop, "dshsl-send-summary")).includes("30 投递"));
+const atCapRow = renderSendRow(sendBlock({ ...SEND_CARD, targets: Array.from({ length: 24 }, (_, i) => ({ sessionId: `session-worker-${i}`, outcome: "delivered", detail: "已投递" })), summary: { delivered: 24, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 } }));
+check("评审 #2 对照: the cap is inclusive — a receipt at exactly 24 rows renders all 24 with NO truncation note", treeAllByClass(atCapRow, "dshsl-send-target").length === 24 && treeByClass(atCapRow, "dshsl-send-rows-trunc") === null);
+check("评审 #2 对照: ... and an ordinary 3-target receipt is untouched by the bound", treeAllByClass(cardRow, "dshsl-send-target").length === 3 && treeByClass(cardRow, "dshsl-send-rows-trunc") === null);
+
 // ---------------------------------------------------------------------------
 // U15 (§10.1.3 D): this plugin's own Conversation Definition and the top-level
 // node it produces — matched on EXISTING tool/call + tool/result events only.
@@ -656,8 +679,10 @@ check("F3: the module-level inject array is back to the three services apply() c
 check("F3: the definition still reaches the registry through the dynamic injection when the service IS there (the §10.1.5 contract is a fallback, not a removal)", moduleExports.inject.indexOf("uiConversation") === -1 && registeredDefinition !== null && registeredDefinition.kind === "team-link-send");
 
 // --- B3 (差异审计): one refused slot registration costs that row alone -------
-// The three §10.1 registrations share one apply(): before the guard, the first
-// `slots.register` to throw aborted the two after it (and the deep-link opener).
+// All FOUR slot registrations share one apply(): before the guard, the first
+// `slots.register` to throw aborted every registration after it (and the
+// deep-link opener). That includes the header strip, which was the last
+// unguarded one (round-1 🔵 #3) and — running first — the most costly to lose.
 const names = (result) => result.fresh.map((entry) => entry.options.name === "conversation.chat.node" ? `${entry.options.name}:${entry.options.key}` : entry.options.name).sort().join(",");
 const toolRowRefused = applyWith({ refuseRegister: (options) => options.name === "tool.call.toolview" });
 check("B3: a refused tool row does not abort apply()", toolRowRefused.thrown === null);
@@ -669,6 +694,12 @@ const topRowRefused = applyWith({ refuseRegister: (options) => options.name === 
 check("B3: a refused top-level row costs that row alone — the two other registrations still land", topRowRefused.thrown === null && names(topRowRefused) === "conversation.chat.node:context,conversation.session.header.actions,tool.call.toolview" && topRowRefused.warnings.length === 1 && topRowRefused.warnings[0].includes("team-link-send"));
 const injectRefused = applyWith({ refuseInject: (name) => name === "tool.call.toolview" });
 check("B3: a THROWING `slots.inject` is caught too (the tool row is the only casualty)", injectRefused.thrown === null && names(injectRefused) === "conversation.chat.node:context,conversation.chat.node:team-link-send,conversation.session.header.actions" && injectRefused.warnings.length === 1 && injectRefused.warnings[0].includes("slots.inject refused"));
+// The header strip is the FOURTH registration and the first to run: unguarded, a
+// refusal there aborted the tool row, both chat rows and the deep-link opener
+// (round-1 🔵 #3 — the asymmetry B3 exists to remove).
+const headerRefused = applyWith({ refuseRegister: (options) => options.name === "conversation.session.header.actions" });
+check("B3: a refused HEADER strip costs that row alone — all three §10.1 registrations still land", headerRefused.thrown === null && names(headerRefused) === "conversation.chat.node:context,conversation.chat.node:team-link-send,tool.call.toolview" && headerRefused.warnings.length === 1 && headerRefused.warnings[0].includes("conversation.session.header.actions") && headerRefused.warnings[0].includes("other slots are unaffected"));
+check("B3: ... and the top-level definition still registers (the strip is not on the definition's path)", headerRefused.definitionCalls === 1);
 
 // --- dictionary parity (the copy both faces render comes from one place) -----
 const zhKeys = Object.keys(localeDicts.get("zh")).sort().join(",");

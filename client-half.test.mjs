@@ -11,7 +11,12 @@
 import { readFile } from "node:fs/promises";
 
 let failures = 0;
+/** Assertions executed in this run, printed at the end so the README figure is
+ * checkable against the run instead of remembered (same rule as the host half,
+ * §9.6 ⑧). */
+let assertions = 0;
 function check(label, cond) {
+	assertions += 1;
 	console.log(`${cond ? "PASS" : "FAIL"}  ${label}`);
 	if (!cond) failures += 1;
 }
@@ -69,15 +74,33 @@ check("factory only requires react", required.length === 1 && required[0] === "r
 // ---------------------------------------------------------------------------
 
 const registrations = [];
+/** Dictionary registered per language: `ctx.locale.register(ns, lang, dict)`.
+ * Captured so the assertions can read the REAL copy (a key renamed in lib/ and
+ * not here would show up as the key name itself). */
+const localeDicts = new Map();
+/** The Definition this plugin hands to the uiConversation registry (§10.1.3 D);
+ * U15 drives it the way the assembler does. */
+let registeredDefinition = null;
+const uiConversationStub = {
+	events: {
+		register(definition) { registeredDefinition = definition; return () => {}; },
+	},
+};
 const ctx = {
 	effect(fn) { const disposer = fn(); return typeof disposer === "function" ? disposer : () => {}; },
-	locale: { register() { return () => {}; }, bind() { return (key) => key; } },
+	locale: {
+		register(_namespace, lang, dict) { localeDicts.set(lang, dict); return () => {}; },
+		bind() { return (key) => key; },
+	},
 	slots: {
 		inject(_name, register) { return register(); },
 		register(options, component) { registrations.push({ options, component }); return () => {}; },
 		entries() { return []; },
 	},
 	sessions: { list: { getSnapshot() { return { byId: {} }; } }, open() {} },
+	// cordis: `inject` runs the callback on the context that holds the services.
+	// The stub is the "already active" case.
+	inject(_specs, callback) { return callback({ uiConversation: uiConversationStub }); },
 };
 
 moduleExports.apply(ctx);
@@ -245,7 +268,309 @@ const foreignHalf = render({ source: { kind: "plugin", plugin: "other-plugin", f
 check("a lone surrogate in delegated foreign context is repaired", isDelegated(foreignHalf) && !LONE.test(delegatedTextOf(foreignHalf)));
 check("the delegated foreign text is otherwise untouched", delegatedTextOf(foreignHalf).includes("半截文本"));
 
+// ---------------------------------------------------------------------------
+// U14 (§10.1.1 A): the sender's own tool row — `tool.call.toolview` keyed by
+// the WIRE TOOL NAME, rendered from the §10.1.2 receipt, plain text otherwise.
+// ---------------------------------------------------------------------------
+
+/** Render a React-stub tree the way React would: the stub's createElement only
+ * BUILDS elements, so the one expansion React performs for a function component
+ * is done here (`type({...props, children})`). Fragments are flattened too. */
+function flatten(tree) {
+	if (tree === null || tree === undefined || typeof tree !== "object") return tree;
+	if (Array.isArray(tree)) return tree.map(flatten);
+	if (typeof tree.type === "function") return flatten(tree.type({ ...tree.props, children: tree.children }));
+	if (tree.type === React.Fragment) return flatten(tree.children);
+	const children = tree.children === undefined ? [] : Array.isArray(tree.children) ? tree.children.map(flatten) : [flatten(tree.children)];
+	return { type: tree.type, props: tree.props, children };
+}
+/** Flat text of a React-stub tree (strings and numbers, in child order). */
+function treeText(tree) {
+	if (tree === null || tree === undefined || tree === false) return "";
+	if (typeof tree === "string" || typeof tree === "number") return String(tree);
+	if (Array.isArray(tree)) return tree.map(treeText).join("");
+	if (typeof tree === "object" && tree.children !== undefined) return treeText(tree.children);
+	return "";
+}
+/** First node in the tree whose props carry this className. */
+function treeByClass(tree, className) {
+	if (tree === null || tree === undefined || typeof tree !== "object") return null;
+	if (Array.isArray(tree)) {
+		for (const child of tree) {
+			const hit = treeByClass(child, className);
+			if (hit !== null) return hit;
+		}
+		return null;
+	}
+	if (tree.props !== undefined && tree.props.className === className) return tree;
+	return treeByClass(tree.children, className);
+}
+/** All nodes in the tree whose props carry this className (target rows). */
+function treeAllByClass(tree, className) {
+	if (tree === null || tree === undefined || typeof tree !== "object") return [];
+	if (Array.isArray(tree)) return tree.flatMap((child) => treeAllByClass(child, className));
+	const here = tree.props !== undefined && tree.props.className === className ? [tree] : [];
+	return [...here, ...treeAllByClass(tree.children, className)];
+}
+const isSendCard = (tree) => {
+	const card = treeByClass(tree, "dshsl-relay dshsl-send");
+	return card !== null && card.props["data-slp-send"] === "row";
+};
+const isSendPlain = (tree) => {
+	const plain = treeByClass(tree, "dshsl-plain");
+	return plain !== null && plain.props["data-slp-send"] === "plain";
+};
+
+const toolViewSlot = registrations.find((entry) => entry.options.name === "tool.call.toolview");
+check("U14: the plugin claims the keyed tool view slot for its own wire tool name", toolViewSlot !== undefined);
+// The dispatch is a plain keyed lookup against the wire tool name, and a typo
+// falls back to the generic tool row with NO error anywhere — so the literal is
+// the thing worth pinning, together with the near-misses it must not be.
+check("U14: the slot key is the wire tool name VERBATIM (a typo would silently fall back to the generic row)", toolViewSlot.options.key === "team_link_send");
+check("U14: ... and no near-miss claims that tool row (the tool view slot holds exactly one key)", ["team-link-send", "team_link_send ", "Team_link_send", "team_link_send2"].every((near) => registrations.filter((entry) => entry.options.name === "tool.call.toolview").every((entry) => entry.options.key !== near)) && registrations.filter((entry) => entry.options.name === "tool.call.toolview").length === 1);
+
+const sendBlock = (meta, text = "已投递到 session-worker-a（已配对通道，免确认自动投递）：目标空闲，已唤醒目标会话并作为新回合处理。") => ({
+	kind: "tool-result",
+	seq: 42,
+	time: 1_700_000_000_000,
+	callId: "call-1",
+	call: { name: "team_link_send", argsRaw: "{\"message\":\"x\"}" },
+	callTime: 1_699_999_999_000,
+	content: [{ type: "text", text }],
+	isError: false,
+	meta,
+	subCalls: [],
+});
+const runningBlock = () => ({ callId: "call-1", name: "team_link_send", argsRaw: "{\"message\":\"x\"}", turn: 1, step: 1, time: 1_700_000_000_000, subCalls: [] });
+/** The real copy of the zh dictionary (a missing key falls back to the key name,
+ * so an assertion naming the copy pins the key too). */
+const tZh = (key) => (localeDicts.get("zh") !== undefined && Object.prototype.hasOwnProperty.call(localeDicts.get("zh"), key) ? localeDicts.get("zh")[key] : key);
+const renderSendRow = (block, toolName = "team_link_send") => flatten(toolViewSlot.component({ callId: "call-1", toolName, block, t: tZh }));
+
+/** A §10.1.2 receipt as the host half mints it (the client never trusts more). */
+const SEND_CARD = {
+	kind: "team-link-send",
+	v: 1,
+	at: new Date(2026, 8, 19, 12, 0, 0).valueOf(),
+	senderSessionId: "session-self",
+	meta: { type: "ruling", pri: "P0", ref: "slp-a1b2" },
+	message: { text: "裁决：走 A 方案", truncated: false, chars: 9 },
+	targets: [
+		{ sessionId: "session-worker-a", expr: "team:night-shift/*", outcome: "delivered", detail: "已投递到 session-worker-a：目标空闲，已唤醒目标会话。", busy: { running: false } },
+		{ sessionId: "session-worker-b", expr: "team:night-shift/*", outcome: "refused", detail: "未投递：目标会话用户未确认接收。" },
+		{ sessionId: null, expr: "team:night-shift/reviewer", outcome: "no-holder", detail: "该角色当前空缺" },
+	],
+	summary: { delivered: 1, refused: 1, noAgent: 0, noHolder: 1, deduped: 2 },
+	fanout: true,
+};
+
+const cardRow = renderSendRow(sendBlock(SEND_CARD));
+check("U14: a settled call carrying a receipt renders as the send card, not a plain row", isSendCard(cardRow) && !isSendPlain(cardRow));
+check("U14: the card is the receiver's card with the outbound accent (same card component/classes)", treeByClass(cardRow, "dshsl-relay dshsl-send") !== null && treeByClass(cardRow, "dshsl-relay-head") !== null && treeByClass(cardRow, "dshsl-relay-body") !== null && treeByClass(cardRow, "dshsl-relay-foot") !== null);
+check("U14: the head states the title, the sender session and the delivery time", treeText(treeByClass(cardRow, "dshsl-relay-head")).includes("已发出跨会话消息") && treeText(treeByClass(cardRow, "dshsl-relay-head")).includes("session-self") && treeText(treeByClass(cardRow, "dshsl-relay-head")).includes(new Date(SEND_CARD.at).toLocaleString()));
+check("U14: the §3.4 envelope rides the head as its compact k=v fields", treeText(treeByClass(cardRow, "dshsl-send-env")) === "type=ruling pri=P0 ref=slp-a1b2");
+check("U14: the body shows the message that was sent", treeText(treeByClass(cardRow, "dshsl-relay-body")).includes("裁决：走 A 方案"));
+check("U14: a non-truncated body carries no truncation note", !treeText(treeByClass(cardRow, "dshsl-relay-body")).includes("正文已截断"));
+const detailRows = treeAllByClass(cardRow, "dshsl-send-target");
+check("U14: A carries the per-target DETAIL — one row per target, with its outcome label", detailRows.length === 3 && detailRows.map((row) => treeText(row)).join("|") === [
+	"已投递 已投递到 session-worker-a：目标空闲，已唤醒目标会话。",
+	"被拒绝 未投递：目标会话用户未确认接收。",
+	"空缺目标 该角色当前空缺",
+].join("|"));
+check("U14: ... and every outcome is carried as a data attribute (a refused row is visually distinct)", detailRows.map((row) => treeByClass(row, "dshsl-send-outcome").props["data-outcome"]).join(",") === "delivered,refused,no-holder");
+check("U14: the summary restates the receipt's own counts, plus dedupe when there is one", treeText(treeByClass(cardRow, "dshsl-send-summary")) === "汇总：1 投递 / 1 拒绝 / 0 无活动代理 / 1 空缺目标 · 2 个重复目标已去重");
+const busyRow = renderSendRow(sendBlock({ ...SEND_CARD, targets: [{ sessionId: "session-worker-a", outcome: "delivered", detail: "已投递", busy: { running: true, minutes: 7 } }], summary: { delivered: 1, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 } }));
+check("U14: a running target's row carries the §3.5 busy prediction with its minutes", treeText(busyRow).includes("（目标回合已运行 7 分钟——steer 注入当前回合）"));
+const busyUnknownRow = renderSendRow(sendBlock({ ...SEND_CARD, targets: [{ sessionId: "session-worker-a", outcome: "delivered", detail: "已投递", busy: { running: true } }], summary: { delivered: 1, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 } }));
+check("U14: an unreadable turn start states steer without inventing a number", treeText(busyUnknownRow).includes("（目标回合运行中——起始时间不可读）") && !/已运行 \d+ 分钟/u.test(treeText(busyUnknownRow)));
+const truncatedRow = renderSendRow(sendBlock({ ...SEND_CARD, message: { text: "头" + "..." + "尾", truncated: true, chars: 2100 } }));
+check("U14: a truncated body says so and states the ORIGINAL code-point count", treeText(treeByClass(truncatedRow, "dshsl-relay-body")).includes("（正文已截断，原文 2100 码点）"));
+const emptyBodyRow = renderSendRow(sendBlock({ ...SEND_CARD, message: { text: "", truncated: false, chars: 0 } }));
+check("U14: an empty body falls back to the same（空）marker the receiver's card uses", treeText(treeByClass(emptyBodyRow, "dshsl-relay-body")).includes("（空）"));
+const noEnvelopeRow = renderSendRow(sendBlock({ ...SEND_CARD, meta: undefined }));
+check("U14: a receipt without an envelope renders no envelope span at all", treeByClass(noEnvelopeRow, "dshsl-send-env") === null);
+
+// --- the fallback: no receipt → the model-visible text, never a half card ----
+const runningRow = renderSendRow(runningBlock());
+check("U14: an in-flight call has no receipt yet and renders the plain row", isSendPlain(runningRow) && !isSendCard(runningRow));
+check("U14: the plain row names the call and says it is still running", treeText(runningRow).includes("工具调用") && treeText(runningRow).includes("team_link_send") && treeText(runningRow).includes("调用中…"));
+const noMetaRow = renderSendRow(sendBlock(undefined, "已投递到 session-worker-a（已配对通道，免确认自动投递）：目标空闲。"));
+check("U14: a settled call with NO meta falls back to plain text (every log written before §10.1)", isSendPlain(noMetaRow) && !isSendCard(noMetaRow));
+check("U14: ... and the fallback shows the model-visible result verbatim", treeText(treeByClass(noMetaRow, "dshsl-plain-body")) === "已投递到 session-worker-a（已配对通道，免确认自动投递）：目标空闲。" && treeText(noMetaRow).includes("无结构化回执"));
+check("U14: a result with no text blocks still renders the plain row (no empty card, no crash)", isSendPlain(renderSendRow({ ...sendBlock(undefined), content: [] })));
+
+// --- anything this build cannot read is NOT a card ---------------------------
+const foreignMeta = renderSendRow(sendBlock({ kind: "fs-search", v: 1, results: [] }));
+check("U14: another tool's meta is not dressed as our card (the discriminator is ours)", isSendPlain(foreignMeta) && !isSendCard(foreignMeta));
+const malformed = [
+	["not an object", "nope"],
+	["null", null],
+	["an array", []],
+	["a wrong version", { ...SEND_CARD, v: 2 }],
+	["a missing message", { ...SEND_CARD, message: undefined }],
+	["a missing sender", { ...SEND_CARD, senderSessionId: "" }],
+	["a non-numeric time", { ...SEND_CARD, at: "yesterday" }],
+	["targets that are not an array", { ...SEND_CARD, targets: {} }],
+	["a target with an unknown outcome type", { ...SEND_CARD, targets: [{ sessionId: "s", outcome: 7, detail: "d" }] }],
+	["a target without a detail sentence", { ...SEND_CARD, targets: [{ sessionId: "s", outcome: "delivered" }] }],
+	["a target id that is neither a string nor null", { ...SEND_CARD, targets: [{ sessionId: 5, outcome: "delivered", detail: "d" }] }],
+	["no summary", { ...SEND_CARD, summary: undefined }],
+];
+check(`U14: none of the ${malformed.length} unreadable receipt shapes becomes a card`, malformed.every(([, meta]) => isSendPlain(renderSendRow(sendBlock(meta))) ));
+check("U14: ... and each of them still shows the model-visible text instead", malformed.every(([, meta]) => treeText(renderSendRow(sendBlock(meta, "回退正文"))).includes("回退正文")));
+const hostile = { kind: "team-link-send", get v() { throw new Error("hostile getter"); } };
+check("U14: a receipt with a throwing getter degrades to the plain row instead of taking the transcript down", isSendPlain(renderSendRow(sendBlock(hostile))));
+check("U14: the reader is total — it never throws for any of these shapes", malformed.every(([, meta]) => {
+	try {
+		renderSendRow(sendBlock(meta));
+		return true;
+	} catch {
+		return false;
+	}
+}));
+
+// ---------------------------------------------------------------------------
+// U15 (§10.1.3 D): this plugin's own Conversation Definition and the top-level
+// node it produces — matched on EXISTING tool/call + tool/result events only.
+// ---------------------------------------------------------------------------
+
+const relayNodeSlot = registrations.find((entry) => entry.options.name === "conversation.chat.node" && entry.options.key === "context");
+const topSlot = registrations.find((entry) => entry.options.name === "conversation.chat.node" && entry.options.key === "team-link-send");
+check("U15: the top-level node renderer is registered under its own kind, beside the receiver's context card", topSlot !== undefined && relayNodeSlot !== undefined && topSlot.options.key !== relayNodeSlot.options.key);
+check("U15: ... at the §10.1.3 priority, in this plugin's locale namespace", topSlot.options.priority === -90 && topSlot.options.locale === "dsh-team-link");
+check("U15: the two coexist on the same keyed slot (a second entry at the SAME key would throw; these are different keys)", registrations.filter((entry) => entry.options.name === "conversation.chat.node").length === 2);
+check("U15: the definition reaches the uiConversation registry, and its kind is the card's discriminator (def / slot / data cannot drift apart)", registeredDefinition !== null && registeredDefinition.kind === "team-link-send" && registeredDefinition.kind === topSlot.options.key);
+check("U15: the definition declares the chat view target together with a buildViewNode (the registry requires the pair)", registeredDefinition.target === "chat" && typeof registeredDefinition.buildViewNode === "function");
+check("U15: the definition owns no Location-data publication and no new event source — it is a reader of the existing log", registeredDefinition.buildLocationData === undefined);
+
+const callEvent = (name, callId, seq = 10, time = 1_700_000_000_000) => ({ type: "tool/call", seq, time, data: { turn: 1, step: 1, callId, name, arguments: "{\"message\":\"x\"}" } });
+const resultEvent = (callId, meta, seq = 11, time = 1_700_000_001_000, name = "team_link_send") => ({
+	type: "tool/result",
+	seq,
+	time,
+	data: { turn: 1, step: 1, message: { source: { callId, name, role: "tool" }, content: [{ type: "text", text: "已投递" }] }, meta },
+});
+
+check("U15: a tool/call for THIS tool is claimed as a start, keyed by the call id", JSON.stringify(registeredDefinition.match(callEvent("team_link_send", "call-9"))) === JSON.stringify({ id: "call-9", role: "start" }));
+check("U15: a tool/call for any other tool is NOT claimed (the kind never fires on foreign calls)", ["send_message", "team_link_list_sessions", "bash"].every((name) => registeredDefinition.match(callEvent(name, "call-9")) === null));
+check("U15: no other event type is claimed — the definition reads existing events, it does not invent one", ["user/message", "assistant/message", "turn/start", "turn/end", "command/run", "team-link-send"].every((type) => registeredDefinition.match({ type, seq: 1, time: 1, data: {} }) === null));
+check("U15: a tool/result carrying our receipt is claimed as the update for that call", JSON.stringify(registeredDefinition.match(resultEvent("call-9", SEND_CARD))) === JSON.stringify({ id: "call-9", role: "update" }));
+check("U15: a tool/result with no receipt is NOT claimed (no engine Context for every tool call in the session)", registeredDefinition.match(resultEvent("call-9", undefined)) === null && registeredDefinition.match(resultEvent("call-9", { kind: "fs-search" })) === null);
+check("U15: a malformed event never throws the match (the reader is total)", [null, undefined, 7, {}, { type: "tool/call" }, { type: "tool/result" }].every((event) => {
+	try {
+		return registeredDefinition.match(event) === null || typeof registeredDefinition.match(event) === "object";
+	} catch {
+		return false;
+	}
+}));
+
+/** Drive the definition the way the assembler does: `start` for the call, then
+ * `update` for each later match, with the Context grown as it goes (the start
+ * event is always `matches[0]`, per the registry's own invariant). */
+function driveDefinition(events) {
+	let context = { key: "team-link-send\u0000call-1", kind: "team-link-send", id: "call-1", matches: [], start: undefined, state: undefined };
+	for (const event of events) {
+		const match = registeredDefinition.match(event);
+		if (match === null) continue;
+		const entry = { event, role: match.role, location: { kind: "step", turn: {}, step: {} } };
+		const isStart = match.role === "start";
+		context = { ...context, matches: [...context.matches, entry], start: isStart ? entry : context.start };
+		if (isStart) context.state = registeredDefinition.start(context, entry);
+		else if (context.state !== undefined) context.state = registeredDefinition.update(context, entry);
+	}
+	return { context, node: registeredDefinition.buildViewNode(context) };
+}
+
+const fullRun = driveDefinition([callEvent("team_link_send", "call-1"), resultEvent("call-1", SEND_CARD)]);
+check("U15: a settled send produces a top-level node", fullRun.node !== null && fullRun.node.kind === "team-link-send");
+check("U15: the node is a full chat view node — key/kind/id/target/anchorSeq/location/visibility/data", fullRun.node.key === fullRun.context.key && fullRun.node.id === "call-1" && fullRun.node.target === "chat" && fullRun.node.anchorSeq === 10 && fullRun.node.visibility === "visible" && fullRun.node.location !== undefined && fullRun.node.data !== undefined);
+check("U15: the node renders the SUMMARY face — recipients and counts, not the per-target detail sentences (that stays in the tool row)", treeText(flatten(topSlot.component({ node: fullRun.node, t: tZh }))).includes("发给 3 个目标：") && treeText(flatten(topSlot.component({ node: fullRun.node, t: tZh }))).includes("session-worker-b") && !treeText(flatten(topSlot.component({ node: fullRun.node, t: tZh }))).includes("未投递：目标会话用户未确认接收。"));
+check("U15: ... and the summary counts, the body and the time are on it", treeText(flatten(topSlot.component({ node: fullRun.node, t: tZh }))).includes("汇总：1 投递 / 1 拒绝 / 0 无活动代理 / 1 空缺目标") && treeText(flatten(topSlot.component({ node: fullRun.node, t: tZh }))).includes("裁决：走 A 方案") && treeText(flatten(topSlot.component({ node: fullRun.node, t: tZh }))).includes(new Date(SEND_CARD.at).toLocaleString()));
+check("U15: the top-level card is flagged as the top face (a different face from the tool row's)", treeByClass(flatten(topSlot.component({ node: fullRun.node, t: tZh })), "dshsl-relay dshsl-send").props["data-slp-send"] === "top");
+
+const runningRun = driveDefinition([callEvent("team_link_send", "call-1")]);
+check("U15: an in-flight send produces NO node yet (there is no receipt to draw)", runningRun.node === null);
+const noCardRun = driveDefinition([callEvent("team_link_send", "call-1"), resultEvent("call-1", undefined)]);
+check("U15: a call whose result carries no receipt produces no node (and no half card)", noCardRun.node === null);
+
+// --- window truncation: only the tool/result is in the loaded history -------
+const truncated = driveDefinition([resultEvent("call-1", SEND_CARD, 42)]);
+check("U15: with the tool/call outside the window the fallback still produces the node", truncated.node !== null && truncated.node.kind === "team-link-send" && truncated.context.start === undefined);
+check("U15: ... anchored on the result event that is actually loaded", truncated.node !== null && truncated.node.anchorSeq === 42 && truncated.node.location !== undefined);
+// The wire shape carries no tool name on a result (`ToolMessageSource` is exactly
+// `{kind, callId}`), so with the call head out of window the receipt's own
+// discriminator is the only claim available — and a meta that is NOT our card
+// never becomes a node.
+const truncatedForeign = driveDefinition([resultEvent("call-1", { kind: "other-tool" }, 42)]);
+check("U15: a lone result WITHOUT our receipt stays unrendered — no node is invented for a foreign call", truncatedForeign.node === null);
+check("U15: a node built from a Context the assembler never gave a state does not throw", driveDefinition([{ type: "tool/result", seq: 1, time: 1, data: null }]).node === null);
+
+// --- degrade, never throw (client failure must not take the session down) ---
+check("U15: a node with an unreadable payload renders NOTHING instead of throwing", [null, {}, { data: null }, { data: {} }, { data: { card: { kind: "team-link-send" } } }].every((node) => {
+	try {
+		return topSlot.component({ node, t: tZh }) === null;
+	} catch {
+		return false;
+	}
+}));
+check("U15: the renderer stays total for a hostile getter too", (() => {
+	try {
+		return topSlot.component({ node: { get data() { throw new Error("hostile"); } }, t: tZh }) === null;
+	} catch {
+		return false;
+	}
+})());
+
+// --- the degradation contract: a broken registry is "no top-level row" ------
+// §10.1.5 降级优先: the uiConversation face is a newer public surface, so a shell
+// whose registry refuses the definition (or lacks the service entirely) must
+// cost the top-level card and NOTHING else — apply() must still complete, and
+// the trace is one browser-console line (never a session-log event, §10.3).
+/** Apply the bundle again against a fresh context and report what happened. */
+function applyWith(overrides) {
+	const fresh = [];
+	const warnings = [];
+	const context = {
+		effect(fn) { const disposer = fn(); return typeof disposer === "function" ? disposer : () => {}; },
+		locale: { register(_namespace, lang, dict) { localeDicts.set(lang, dict); return () => {}; }, bind() { return (key) => key; } },
+		slots: {
+			inject(_name, register) { return register(); },
+			register(options, component) { fresh.push({ options, component }); return () => {}; },
+			entries() { return []; },
+		},
+		sessions: { list: { getSnapshot() { return { byId: {} }; } }, open() {} },
+		...overrides,
+	};
+	const realWarn = console.warn;
+	console.warn = (...args) => warnings.push(args.map((value) => String(value)).join(" "));
+	// The style tag is module-scope and already installed: keep the "injected
+	// once" invariant true for these extra applies too.
+	const realQuery = documentStub.querySelector;
+	documentStub.querySelector = () => ({});
+	let thrown = null;
+	try {
+		moduleExports.apply(context);
+	} catch (error) {
+		thrown = error;
+	} finally {
+		documentStub.querySelector = realQuery;
+		console.warn = realWarn;
+	}
+	return { fresh, warnings, thrown, registered: registeredDefinition };
+}
+
+const refusing = applyWith({ inject(_specs, callback) { return callback({ uiConversation: { events: { register() { throw new Error("registry refused"); } } } }); } });
+check("U15: a registry that REFUSES the definition does not throw out of apply()", refusing.thrown === null);
+check("U15: ... it costs only the top-level card, and says so once in the browser console", refusing.warnings.length === 1 && refusing.warnings[0].includes("uiConversation.events.register") && refusing.warnings[0].includes("top-level message card stays off"));
+check("U15: ... while every other registration still lands (the header strip, the tool row, both chat rows)", refusing.fresh.length === 4 && refusing.fresh.filter((entry) => entry.options.name === "conversation.chat.node").length === 2 && refusing.fresh.some((entry) => entry.options.name === "tool.call.toolview" && entry.options.key === "team_link_send"));
+const serviceless = applyWith({ inject(_specs, callback) { return callback({}); } });
+check("U15: a shell without the uiConversation service degrades silently — an older shell is not a failure", serviceless.thrown === null && serviceless.warnings.length === 0 && serviceless.fresh.length === 4);
+const injectless = applyWith({ inject: undefined });
+check("U15: a client context that cannot inject at all is still applied to completion", injectless.thrown === null && injectless.warnings.length === 0 && injectless.fresh.length === 4);
+check("U15: the definition D's registry face is only reached through inject — the plugin never writes an event of its own", moduleExports.inject.join(",") === "slots,sessions,locale,uiConversation");
+
 console.log("");
 if (failures === 0) console.log("ALL PASS");
 else console.log(`${failures} FAILURE(S)`);
+console.log(`assertion total: ${assertions} (failed: ${failures})`);
 process.exitCode = failures === 0 ? 0 : 1;

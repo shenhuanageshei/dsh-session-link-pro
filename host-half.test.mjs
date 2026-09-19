@@ -1640,6 +1640,159 @@ check("§3.5: inside a fan-out the running target's row carries the prediction a
 check("§3.5: and the fan-out still steers the running target and follows up the idle one", busyFanEnv.calls("session-worker-a").steered.length === 1 && busyFanEnv.calls("session-worker-b").followedup.length === 1);
 
 // ---------------------------------------------------------------------------
+// U13 (§10.1.2): the sender-side receipt — `output.presentationMeta`
+// ---------------------------------------------------------------------------
+
+/** One dispatch and its card, projected the way the Tool registry does it: the
+ * body stashes the card against the frozen `exec.arguments` object and the
+ * registry later calls `presentationMeta` with that SAME object (dsh-tools:
+ * `tool.execute(exec.arguments, exec)` then
+ * `tool.output.presentationMeta(exec.arguments, value)`). Reusing the object here
+ * mirrors that identity instead of re-deriving it. */
+async function sendWithCard(env, args, exec) {
+	const value = await env.send.execute(args, exec);
+	return { value, card: env.send.output.presentationMeta(args, value) };
+}
+/** Deep equality of two JSON values (key order included — a replayed log must
+ *  reproduce the identical card). */
+const sameJson = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+const isCardShape = (card) => card !== null && typeof card === "object" && card.kind === "team-link-send" && card.v === 1;
+const outcomesOf = (card) => card.targets.map((target) => `${target.sessionId ?? "-"}:${target.outcome}`).join(",");
+
+const receiptEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+check("U13: team_link_send declares output.presentationMeta — the §10.1.2 carrier (pre-fix: undefined, so the sender row has no structured source at all)", typeof receiptEnv.send.output.presentationMeta === "function");
+const receiptArgs = { targetSessionId: "session-worker-a", message: "裁决：走 A 方案", meta: { type: "ruling", pri: "P0", ref: "slp-a1b2" } };
+const { value: receiptText, card: receiptCard } = await sendWithCard(receiptEnv, receiptArgs, execFor(receiptEnv.senderAgent));
+check("U13: the model-visible text is untouched — the returned value is still one plain sentence", typeof receiptText === "string" && receiptText.startsWith("已投递到 session-worker-a") && receiptText.includes("目标空闲，已唤醒目标会话并作为新回合处理"));
+check("U13: ... and output.render still snapshots it as the single text block textOutput produced (same schema, same renderer)", sameJson(receiptEnv.send.output.render(receiptArgs, receiptText), [{ type: "text", text: receiptText }]));
+check("U13: the card carries the §10.1.2 discriminators and the sender identity", isCardShape(receiptCard) && receiptCard.senderSessionId === "session-self" && typeof receiptCard.at === "number" && receiptCard.at > 0 && receiptCard.fanout === false);
+check("U13: a single-target receipt has exactly one target row, with the id and the delivered outcome", receiptCard.targets.length === 1 && receiptCard.targets[0].sessionId === "session-worker-a" && receiptCard.targets[0].outcome === "delivered");
+check("U13: the row detail is the SAME sentence the text report prints — one source, two faces", receiptCard.targets[0].detail === receiptText);
+check("U13: a literal session id is not an addressing expression, so the row carries no expr", receiptCard.targets[0].expr === undefined);
+check("U13: the summary counts the row kinds (delivered/refused/noAgent/noHolder/deduped)", sameJson(receiptCard.summary, { delivered: 1, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 }));
+check("U13: the body is carried in full when it is inside the cap (chars = code points, truncated false)", !receiptCard.message.truncated && receiptCard.message.chars === [..."裁决：走 A 方案"].length && receiptCard.message.text === "裁决：走 A 方案");
+check("U13: the envelope appears on the card exactly as normalized for the banner (§3.4 three keys only)", sameJson(receiptCard.meta, { type: "ruling", pri: "P0", ref: "slp-a1b2" }));
+
+const noMetaEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const noMetaArgs = { targetSessionId: "session-worker-a", message: "无信封" };
+const noMetaValue = await noMetaEnv.send.execute(noMetaArgs, execFor(noMetaEnv.senderAgent));
+const noMetaCard = noMetaEnv.send.output.presentationMeta(noMetaArgs, noMetaValue);
+check("U13: a send without an envelope carries no meta member at all (not an empty object)", isCardShape(noMetaCard) && !Object.prototype.hasOwnProperty.call(noMetaCard, "meta"));
+const emptyMetaEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const emptyMetaArgs = { targetSessionId: "session-worker-a", message: "空信封", meta: {} };
+const emptyMetaValue = await emptyMetaEnv.send.execute(emptyMetaArgs, execFor(emptyMetaEnv.senderAgent));
+const emptyMetaCard = emptyMetaEnv.send.output.presentationMeta(emptyMetaArgs, emptyMetaValue);
+check("U13: `meta: {}` is a legal no-op and stays one on the card (no empty meta member)", emptyMetaCard.kind === "team-link-send" && !Object.prototype.hasOwnProperty.call(emptyMetaCard, "meta"));
+
+// --- truncation (§10.1.2 体积纪律: head 1500 + 3-code-point mark + tail 400) ---
+const longTail = "尾".repeat(400);
+const longBody = "头".repeat(1500) + "中".repeat(200) + longTail;
+const longEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const longArgs = { targetSessionId: "session-worker-a", message: longBody };
+const longValue = await longEnv.send.execute(longArgs, execFor(longEnv.senderAgent));
+const longCard = longEnv.send.output.presentationMeta(longArgs, longValue);
+check("U13: a body past the 2000-code-point cap is truncated and says so", longCard.message.truncated === true && longCard.message.chars === 2100);
+check("U13: ... the kept text is head 1500 + the 3-code-point mark + tail 400", [...longCard.message.text].length === 1903 && longCard.message.text.startsWith("头".repeat(1500)) && longCard.message.text.slice(1500, 1503) === "..." && longCard.message.text.endsWith(longTail));
+check("U13: ... and `chars` reports the ORIGINAL code-point count, not the kept one", longCard.message.chars !== [...longCard.message.text].length && longCard.message.chars === [...longBody].length);
+const atCapEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const atCapArgs = { targetSessionId: "session-worker-a", message: "x".repeat(2000) };
+const atCapValue = await atCapEnv.send.execute(atCapArgs, execFor(atCapEnv.senderAgent));
+const atCapCard = atCapEnv.send.output.presentationMeta(atCapArgs, atCapValue);
+check("U13: exactly 2000 code points is NOT truncated (the cap is inclusive)", atCapCard.message.truncated === false && atCapCard.message.chars === 2000 && atCapCard.message.text === "x".repeat(2000));
+const overEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const overArgs = { targetSessionId: "session-worker-a", message: "y".repeat(2001) };
+const overValue = await overEnv.send.execute(overArgs, execFor(overEnv.senderAgent));
+const overCard = overEnv.send.output.presentationMeta(overArgs, overValue);
+check("U13: 2001 code points IS truncated — the boundary is where §10.1.2 says it is", overCard.message.truncated === true && overCard.message.chars === 2001);
+// The cut unit is the code point, and the string is repaired before it is cut, so
+// an astral character straddling the boundary cannot leave half a surrogate pair
+// in the log — the card IS persisted (tool/result.meta).
+const astralBody = "🔵".repeat(2600);
+const astralEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const astralArgs = { targetSessionId: "session-worker-a", message: astralBody };
+const astralValue = await astralEnv.send.execute(astralArgs, execFor(astralEnv.senderAgent));
+const astralCard = astralEnv.send.output.presentationMeta(astralArgs, astralValue);
+check("U13: an astral body is cut on code points — 1500 + 3 + 400, no half pair", [...astralCard.message.text].length === 1903 && astralCard.message.chars === 2600 && !hasLone(astralCard.message.text));
+const poisonedBody = "断开的\uD83D负载";
+const poisonedEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const poisonedArgs = { targetSessionId: "session-worker-a", message: poisonedBody };
+const poisonedValue = await poisonedEnv.send.execute(poisonedArgs, execFor(poisonedEnv.senderAgent));
+const poisonedCard = poisonedEnv.send.output.presentationMeta(poisonedArgs, poisonedValue);
+check("U13: a lone surrogate inherited from the argument is repaired before it can be persisted", !hasLone(poisonedCard.message.text) && poisonedCard.message.chars === [...poisonedBody].length);
+
+// --- busy (§3.5) as a structured value -----------------------------------------
+const receiptBusyEnv = setup({
+	sessions: [],
+	askScript: ["发送", "接收"],
+	targetStatus: "running",
+	eventsBySession: { "session-target": [{ type: "turn/start", seq: 1, time: busyMarkAt, data: { turn: 1 } }] },
+});
+const busyCardArgs = { targetSessionId: "session-target", message: "停一下" };
+const busyCardValue = await receiptBusyEnv.tool("team_link_send").execute(busyCardArgs, execFor(receiptBusyEnv.senderAgent));
+const busyCard = receiptBusyEnv.tool("team_link_send").output.presentationMeta(busyCardArgs, busyCardValue);
+check("U13: a readable running turn becomes `{running:true, minutes}` — the same reading the sentence prints", sameJson(busyCard.targets[0].busy, { running: true, minutes: 5 }));
+const idleCardEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const idleCardArgs = { targetSessionId: "session-worker-a", message: "空闲" };
+const idleCardValue = await idleCardEnv.send.execute(idleCardArgs, execFor(idleCardEnv.senderAgent));
+const idleCard = idleCardEnv.send.output.presentationMeta(idleCardArgs, idleCardValue);
+check("U13: an idle target is `{running:false}` — a followup woke it into a NEW turn, so no minutes", sameJson(idleCard.targets[0].busy, { running: false }));
+const unreadableEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+unreadableEnv.agentFor("session-worker-a").status = "running";
+const unreadableArgs = { targetSessionId: "session-worker-a", message: "读不到起始时间" };
+const unreadableValue = await unreadableEnv.send.execute(unreadableArgs, execFor(unreadableEnv.senderAgent));
+const unreadableCard = unreadableEnv.send.output.presentationMeta(unreadableArgs, unreadableValue);
+check("U13: an unreadable turn start degrades to `{running:true}` — running without a number, never a made-up one", sameJson(unreadableCard.targets[0].busy, { running: true }));
+
+// --- refusals: a card only where a delivery stage actually ran -----------------
+const noAgentEnv = fanEnv();
+const noAgentArgs = { targetSessionId: "session-nope", message: "喂" };
+const noAgentValue = await noAgentEnv.send.execute(noAgentArgs, execFor(noAgentEnv.senderAgent));
+const noAgentCard = noAgentEnv.send.output.presentationMeta(noAgentArgs, noAgentValue);
+check("U13: a no-agent single target still gets a card — the row is the refusal, and it has no busy member", isCardShape(noAgentCard) && noAgentCard.targets[0].outcome === "no-agent" && noAgentCard.targets[0].sessionId === "session-nope" && noAgentCard.targets[0].busy === undefined && noAgentCard.summary.noAgent === 1);
+check("U13: the no-agent row detail is the same ❌ sentence the text report shows", noAgentCard.targets[0].detail === noAgentValue && noAgentCard.targets[0].detail.startsWith("❌ 未投递"));
+
+const argRefuseEnv = fanEnv();
+const bothArgs = { targetSessionId: "session-worker-a", targets: ["session-worker-b"], message: "x" };
+const bothValue = await argRefuseEnv.send.execute(bothArgs, execFor(argRefuseEnv.senderAgent));
+check("U13: 降级优先 — an argument-level refusal (mutually exclusive addresses) projects NO card, so the client falls back to the model-visible text", sameJson(argRefuseEnv.send.output.presentationMeta(bothArgs, bothValue), {}));
+const noAddressArgs = { message: "x" };
+const noAddressValue = await argRefuseEnv.send.execute(noAddressArgs, execFor(argRefuseEnv.senderAgent));
+check("U13: ... and so does a send with no address at all", sameJson(argRefuseEnv.send.output.presentationMeta(noAddressArgs, noAddressValue), {}));
+const badMetaArgs = { targetSessionId: "session-worker-a", message: "x", meta: { type: "nope" } };
+const badMetaValue = await argRefuseEnv.send.execute(badMetaArgs, execFor(argRefuseEnv.senderAgent));
+check("U13: ... and an invalid envelope (a parameter error, delivery never started)", sameJson(argRefuseEnv.send.output.presentationMeta(badMetaArgs, badMetaValue), {}));
+const nineArgs = { targets: Array.from({ length: 9 }, (_, index) => `session-x${index}`), message: "x" };
+const nineValue = await argRefuseEnv.send.execute(nineArgs, execFor(argRefuseEnv.senderAgent));
+check("U13: ... and a >8 fan-out refused on the raw argument (no card, so nothing claims a receipt for zero deliveries)", sameJson(argRefuseEnv.send.output.presentationMeta(nineArgs, nineValue), {}));
+
+// --- fan-out: one row per resolved target, ≤8, with the summary ---------------
+const fanCardEnv = fanEnv({ pairs: [pairSelf("session-worker-a"), pairSelf("session-worker-b")] });
+const fanCardArgs = { targets: ["team:night-shift/*"], message: "全队通知" };
+const fanCardValue = await fanCardEnv.send.execute(fanCardArgs, execFor(fanCardEnv.senderAgent));
+const fanCard = fanCardEnv.send.output.presentationMeta(fanCardArgs, fanCardValue);
+check("U13: a fan-out receipt is flagged as one and holds one row per resolved target", isCardShape(fanCard) && fanCard.fanout === true && fanCard.targets.length === 2 && outcomesOf(fanCard) === "session-worker-a:delivered,session-worker-b:delivered");
+check("U13: each fan-out row carries the addressing expression it came from", fanCard.targets.every((target) => target.expr === "team:night-shift/*"));
+check("U13: every fan-out row detail is the text report's own row sentence", fanCard.targets.every((target) => fanCardValue.includes(`- ${target.sessionId}（via ${target.expr}） → ${target.outcome}：${target.detail}`)));
+check("U13: the fan-out summary counts deliveries and dedupes", sameJson(fanCard.summary, { delivered: 2, refused: 0, noAgent: 0, noHolder: 0, deduped: 0 }));
+const holderCardEnv = fanEnv();
+const holderCardArgs = { targets: ["team:night-shift/reviewer", "session-nope"], message: "x" };
+const holderCardValue = await holderCardEnv.send.execute(holderCardArgs, execFor(holderCardEnv.senderAgent));
+const holderCard = holderCardEnv.send.output.presentationMeta(holderCardArgs, holderCardValue);
+check("U13: a vacant role is a row with sessionId null and the expression kept (no invented id)", holderCard.targets[0].sessionId === null && holderCard.targets[0].outcome === "no-holder" && holderCard.targets[0].expr === "team:night-shift/reviewer");
+check("U13: the buckets match the text report's own summary line", holderCard.summary.noHolder === 1 && holderCard.summary.noAgent === 1 && holderCard.summary.delivered === 0 && holderCardValue.includes("汇总：0 投递 / 0 拒绝 / 1 无活动代理 / 1 空缺目标"));
+const dedupCardEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const dedupCardArgs = { targets: ["session-worker-a", "session-worker-a", "team:night-shift/worker-a"], message: "去重" };
+const dedupCardValue = await dedupCardEnv.send.execute(dedupCardArgs, execFor(dedupCardEnv.senderAgent));
+const dedupCard = dedupCardEnv.send.output.presentationMeta(dedupCardArgs, dedupCardValue);
+check("U13: deduplicated targets collapse to one row, and the dropped count is on the card", dedupCard.targets.length === 1 && dedupCard.summary.deduped === 2);
+const eightCardEnv = fanEnv({ pairs: [pairSelf("session-worker-a")] });
+const eightCardArgs = { targets: ["session-worker-a", ...Array.from({ length: 7 }, (_, index) => `session-y${index}`)], message: "x" };
+const eightCardValue = await eightCardEnv.send.execute(eightCardArgs, execFor(eightCardEnv.senderAgent));
+const eightCard = eightCardEnv.send.output.presentationMeta(eightCardArgs, eightCardValue);
+check("U13: the card's targets bound IS the fan-out bound (≤8), never more", eightCard.targets.length === 8 && eightCard.targets.length <= 8);
+check("U13: the card is lossless JSON, which is what the registry requires before it persists it as tool/result.meta", sameJson(JSON.parse(JSON.stringify(holderCard)), holderCard) && sameJson(JSON.parse(JSON.stringify(fanCard)), fanCard));
+
+// ---------------------------------------------------------------------------
 // M4 (§3.6): rotation — two-phase hand-over, domain-limited migration, TTL rollback
 // ---------------------------------------------------------------------------
 
